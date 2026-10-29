@@ -43,7 +43,21 @@ export function demoDeck(): SavedDeck {
     { data: c('Elvish Mystic', 'Creature — Elf Druid', { power: '1', toughness: '1', manaCost: '{G}', oracle: '{T}: Add {G}.' }), count: 1 },
     { data: c('Garruk Wildspeaker', 'Legendary Planeswalker — Garruk', { manaCost: '{2}{G}{G}', loyalty: '3', oracle: '+1: Untap two target lands.\n−1: Create a 3/3 green Beast creature token.\n−4: Creatures you control get +3/+3 and gain trample until end of turn.' }), count: 1 },
     { data: c('Rancor', 'Enchantment — Aura', { manaCost: '{G}', oracle: 'Enchant creature\nEnchanted creature gets +2/+0 and has trample.' }), count: 1 },
-    { data: c('Grizzly Bears', 'Creature — Bear', { power: '2', toughness: '2', manaCost: '{1}{G}' }), count: 54 },
+    { data: c('Serra Angel', 'Creature — Angel', { power: '4', toughness: '4', manaCost: '{3}{W}{W}', oracle: 'Flying, vigilance' }), count: 1 },
+    { data: c('Giant Spider', 'Creature — Spider', { power: '2', toughness: '4', manaCost: '{3}{G}', oracle: 'Reach' }), count: 1 },
+    { data: c('Vampire Nighthawk', 'Creature — Vampire Shaman', { power: '2', toughness: '3', manaCost: '{1}{B}{B}', oracle: 'Flying\nDeathtouch\nLifelink' }), count: 1 },
+    { data: c('Colossal Dreadmaw', 'Creature — Dinosaur', { power: '6', toughness: '6', manaCost: '{4}{G}{G}', oracle: 'Trample' }), count: 1 },
+    { data: c('Boros Swiftblade', 'Creature — Human Soldier', { power: '1', toughness: '2', manaCost: '{R}{W}', oracle: 'Double strike' }), count: 1 },
+    { data: c('Youthful Knight', 'Creature — Human Knight', { power: '2', toughness: '1', manaCost: '{1}{W}', oracle: 'First strike' }), count: 1 },
+    { data: c('Darksteel Myr', 'Artifact Creature — Myr', { power: '0', toughness: '1', manaCost: '{3}', oracle: 'Indestructible' }), count: 1 },
+    { data: c('Gladecover Scout', 'Creature — Elf Scout', { power: '1', toughness: '1', manaCost: '{G}', oracle: 'Hexproof' }), count: 1 },
+    { data: c('Wall of Wood', 'Creature — Wall', { power: '0', toughness: '3', manaCost: '{G}', oracle: 'Defender' }), count: 1 },
+    { data: c('Raging Goblin', 'Creature — Goblin Berserker', { power: '1', toughness: '1', manaCost: '{R}', oracle: 'Haste' }), count: 1 },
+    { data: c('Ambush Viper', 'Creature — Snake', { power: '2', toughness: '1', manaCost: '{1}{G}', oracle: 'Flash\nDeathtouch' }), count: 1 },
+    { data: c('Boggart Brute', 'Creature — Goblin Warrior', { power: '3', toughness: '2', manaCost: '{2}{R}', oracle: 'Menace' }), count: 1 },
+    { data: c('Guardião de Teste', 'Creature — Spirit', { power: '2', toughness: '2', manaCost: '{1}{U}', oracle: 'Ward {2}' }), count: 1 },
+    { data: c('Murder', 'Instant', { manaCost: '{1}{B}{B}', oracle: 'Destroy target creature.' }), count: 1 },
+    { data: c('Grizzly Bears', 'Creature — Bear', { power: '2', toughness: '2', manaCost: '{1}{G}' }), count: 40 },
   ];
-  return { id: 'demo', name: 'Teste: Selvala (sem internet)', entries, updated: 0 };
+  return { id: 'demo', name: 'Teste: habilidades (sem internet)', entries, updated: 0 };
 }

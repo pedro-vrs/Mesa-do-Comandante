@@ -47,6 +47,15 @@ export interface CardInst {
   ability?: boolean;      // item de pilha que é uma habilidade, não uma carta
   isCommander?: boolean;
   enteredTurn?: number;   // turno em que entrou no campo (enjoo de invocação)
+  damage?: number;        // dano marcado neste turno
+  deathtouched?: boolean; // levou dano de uma fonte com toque mortífero
+  kw?: Record<string, 'eot' | 'perm' | 'off'>; // palavras-chave concedidas ('eot' até o fim do turno) ou removidas
+  attacking?: string;     // id do jogador (ou planeswalker) que está atacando
+  attackTapped?: boolean; // virou por atacar (para desvirar se desistir do ataque)
+  blocking?: string;      // iid do atacante que está bloqueando
+  blockedBy?: string[];   // bloqueadores, na ordem, fixados ao fim do passo de bloqueadores
+  ptPerm?: [number, number]; // modificador de P/R permanente (efeito estático de outra carta, posto à mão)
+  targets?: string[];     // alvos escolhidos (mágica ou habilidade na pilha)
   x: number;              // posição no campo (0..1)
   y: number;
   ptMod: [number, number];
@@ -73,7 +82,9 @@ export interface PlayerState {
   prompts: Prompt[];
 }
 
-export type Prompt = { id: string; kind: 'commander-zone'; iid: string; from: ZoneName };
+export type Prompt =
+  | { id: string; kind: 'commander-zone'; iid: string; from: ZoneName }
+  | { id: string; kind: 'ward'; iid: string; ward: string; cost: string; mana?: string; life?: number; from?: ZoneName };
 
 export const STEPS = [
   'untap', 'upkeep', 'draw', 'main1',
@@ -128,25 +139,30 @@ export type Action =
   | { type: 'draw'; n: number }
   | { type: 'shuffle' }
   | { type: 'mulligan' }
-  | { type: 'move'; iids: string[]; to: ZoneName; toPlayer?: string; position?: 'top' | 'bottom'; x?: number; y?: number; faceDown?: boolean; xValue?: number; force?: boolean }
+  | { type: 'move'; iids: string[]; to: ZoneName; toPlayer?: string; position?: 'top' | 'bottom'; x?: number; y?: number; faceDown?: boolean; xValue?: number; force?: boolean; targets?: string[] }
+  | { type: 'attack'; iid: string; target: string | null; force?: boolean }
+  | { type: 'block'; iid: string; attacker: string | null; force?: boolean }
+  | { type: 'destroy'; iids: string[] }
+  | { type: 'keyword'; iid: string; kw: string; mode: 'eot' | 'perm' | 'off' | 'reset' }
+  | { type: 'damage'; iid: string; delta: number }
   | { type: 'tap'; iids: string[]; value?: boolean; mana?: string; force?: boolean }
   | { type: 'addMana'; mana: string; delta: number }
   | { type: 'untapAll' }
   | { type: 'transform'; iid: string }
   | { type: 'faceDown'; iid: string; value?: boolean }
   | { type: 'counter'; iid: string; kind: string; delta: number }
-  | { type: 'pt'; iid: string; dp: number; dt: number }
+  | { type: 'pt'; iid: string; dp: number; dt: number; perm?: boolean }
   | { type: 'attach'; iid: string; to: string | null }
   | { type: 'control'; iid: string; to: string }
   | { type: 'token'; data: Partial<CardData> & { name: string }; count: number; x?: number; y?: number }
   | { type: 'clone'; iid: string }
-  | { type: 'ability'; text: string; sourceIid?: string }
+  | { type: 'ability'; text: string; sourceIid?: string; targets?: string[]; force?: boolean }
   | { type: 'resolve' }
   | { type: 'life'; delta: number }
   | { type: 'playerCounter'; kind: string; delta: number }
   | { type: 'cmdDamage'; commanderIid: string; delta: number }
-  | { type: 'prompt'; promptId: string; accept: boolean }
-  | { type: 'nextStep' }
+  | { type: 'prompt'; promptId: string; accept: boolean; force?: boolean }
+  | { type: 'nextStep'; force?: boolean }
   | { type: 'setStep'; step: Step }
   | { type: 'endTurn' }
   | { type: 'pass' }

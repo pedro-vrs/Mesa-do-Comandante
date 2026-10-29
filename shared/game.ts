@@ -10,12 +10,17 @@
 //  - regras de turno e mana (opcional): 1 terreno por turno (305.2), velocidade de feitiço (307.1),
 //    custo pago com mana e pagamento automático, reserva esvazia a cada passo (500.4),
 //    enjoo de invocação para virar criaturas por mana (302.6)
+//  - combate (506–511): atacantes, bloqueadores, iniciativa/golpe duplo, atropelar, toque mortífero,
+//    vínculo com a vida, voar/alcance, ameaçar, defensor, ímpeto, vigilância; dano letal destrói (704.5g/h)
+//    salvo indestrutível; dano de comandante contado sozinho
+//  - alvos: resistência a magia (702.11) e salvaguarda (702.21)
 
 import {
   Action, CardData, CardInst, GameState, PlayerState, PlayerZone, Settings, Step, STEPS,
   STEP_LABEL, ZONE_LABEL, ZoneName,
 } from './types.js';
-import { COLORS as MANA_COLORS, emptyPool, frontType, hasFlash, hasHaste, manaOptions, Mana, MANA, MANA_NAME, parseCost, planPayment, costToText } from './mana.js';
+import { COLORS as MANA_COLORS, emptyPool, frontType, manaOptions, Mana, MANA, MANA_NAME, parseCost, planPayment, costToText } from './mana.js';
+import { has, KW_LABEL, KEYWORDS, wardOf, type Keyword } from './keywords.js';
 
 export const COLORS = ['#e4572e', '#3b82f6', '#22a06b', '#a855f7', '#f59e0b', '#ec4899'];
 const PLAYER_ZONES: PlayerZone[] = ['library', 'hand', 'graveyard', 'exile', 'command'];
@@ -96,7 +101,8 @@ function num(v?: string): number { const n = parseInt(v ?? '', 10); return Numbe
 export function effectivePT(c: CardInst): [number, number] | null {
   if (c.data.power === undefined && c.data.toughness === undefined) return null;
   const plus = c.counters['+1/+1'] ?? 0, minus = c.counters['-1/-1'] ?? 0;
-  return [num(c.data.power) + c.ptMod[0] + plus - minus, num(c.data.toughness) + c.ptMod[1] + plus - minus];
+  const pp = c.ptPerm ?? [0, 0];
+  return [num(c.data.power) + c.ptMod[0] + pp[0] + plus - minus, num(c.data.toughness) + c.ptMod[1] + pp[1] + plus - minus];
 }
 
 function shuffle<T>(arr: T[], rand: () => number) {
@@ -147,6 +153,8 @@ function moveCard(s: GameState, ctx: Ctx, actor: string, iid: string, to: ZoneNa
   if (from === 'battlefield' && to !== 'battlefield') {
     for (const other of s.battlefield) if (s.cards[other]?.attachedTo === iid) s.cards[other].attachedTo = undefined;
     c.attachedTo = undefined; c.tapped = false; c.counters = {}; c.ptMod = [0, 0];
+    c.damage = 0; c.deathtouched = false; c.kw = undefined; c.ptPerm = undefined;
+    c.attacking = undefined; c.attackTapped = false; c.blocking = undefined; c.blockedBy = undefined;
     c.controllerId = c.ownerId; c.transformed = false;
   }
 
@@ -253,6 +261,17 @@ export function stateBasedActions(s: GameState, ctx: Ctx) {
       }
     }
   }
+  // 704.5g/h: criatura com dano letal (ou qualquer dano de toque mortífero) é destruída, salvo indestrutível.
+  for (const iid of [...s.battlefield]) {
+    const c = s.cards[iid];
+    if (!c || !isType(c, 'creature') || !(c.damage ?? 0)) continue;
+    const pt = effectivePT(c);
+    const lethal = (pt && c.damage! >= pt[1]) || c.deathtouched;
+    if (!lethal) continue;
+    if (has(c, 'indestructible')) continue;
+    log(s, ctx, `${c.data.name} foi destruída (${c.deathtouched ? 'toque mortífero' : `${c.damage} de dano`})`);
+    moveCard(s, ctx, c.controllerId, iid, 'graveyard', { quiet: true });
+  }
   // 704.5q: contadores +1/+1 e -1/-1 se anulam.
   for (const iid of s.battlefield) {
     const c = s.cards[iid];
@@ -317,9 +336,15 @@ function enterStep(s: GameState, ctx: Ctx, step: Step) {
     const firstTurnSkip = s.turn.number === 1 && s.players.length === 2;
     if (!firstTurnSkip) draw(s, ctx, active.id, 1);
   }
+  if (step === 'damage') combatDamage(s, ctx);
+  if (step === 'combat-end') endCombat(s);
   if (step === 'cleanup') {
-    // 514: o dano marcado some e efeitos "até o fim do turno" acabam (modificadores manuais de P/R).
-    for (const iid of s.battlefield) s.cards[iid].ptMod = [0, 0];
+    // 514: o dano marcado some e efeitos "até o fim do turno" acabam (modificadores manuais de P/R e palavras-chave).
+    for (const iid of s.battlefield) {
+      const c = s.cards[iid];
+      c.ptMod = [0, 0]; c.damage = 0; c.deathtouched = false;
+      if (c.kw) for (const [k, m] of Object.entries(c.kw)) if (m === 'eot') delete c.kw[k];
+    }
   }
 }
 
@@ -331,10 +356,244 @@ function passTurnTo(s: GameState, ctx: Ctx, pid: string) {
   enterStep(s, ctx, 'untap');
 }
 
-function nextStep(s: GameState, ctx: Ctx) {
+function nextStep(s: GameState, ctx: Ctx, force = false) {
   const i = STEPS.indexOf(s.turn.step);
-  if (s.turn.step === 'cleanup') passTurnTo(s, ctx, nextAlive(s, s.turn.activeId));
-  else enterStep(s, ctx, STEPS[i + 1]);
+  if (s.turn.step === 'cleanup') { passTurnTo(s, ctx, nextAlive(s, s.turn.activeId)); return; }
+  if (s.turn.step === 'attackers') {
+    const atk = attackersOf(s);
+    if (!atk.length) { log(s, ctx, 'Ninguém atacou'); enterStep(s, ctx, 'combat-end'); return; }
+    log(s, ctx, `Ataque declarado: ${atk.map(c => `${c.data.name} → ${targetName(s, c.attacking!)}`).join(', ')}`);
+  }
+  if (s.turn.step === 'blockers') {
+    const problems: string[] = [];
+    for (const a of attackersOf(s)) {
+      const bl = blockersOf(s, a.iid);
+      if (bl.length === 1 && has(a, 'menace')) problems.push(`${a.data.name} tem ameaçar e só pode ser bloqueada por 2 ou mais criaturas`);
+    }
+    if (problems.length && s.settings.enforce && !force) throw new RuleError(`${problems.join('; ')}. Ajustem o bloqueio.`, true);
+    for (const a of attackersOf(s)) {
+      const bl = blockersOf(s, a.iid);
+      a.blockedBy = bl.map(b => b.iid);
+      if (bl.length) log(s, ctx, `${a.data.name} foi bloqueada por ${bl.map(b => b.data.name).join(' e ')}`);
+    }
+  }
+  enterStep(s, ctx, STEPS[i + 1]);
+}
+
+// ---------- combate ----------
+
+export function attackersOf(s: GameState) { return s.battlefield.map(i => s.cards[i]).filter(c => c && c.attacking); }
+export function blockersOf(s: GameState, attacker: string) { return s.battlefield.map(i => s.cards[i]).filter(c => c && c.blocking === attacker); }
+
+/** Jogador defensor de um ataque (se o alvo é um planeswalker, o controlador dele). */
+function defenderOf(s: GameState, target: string): string | undefined {
+  if (s.players.some(p => p.id === target)) return target;
+  return s.cards[target]?.controllerId;
+}
+function targetName(s: GameState, target: string) {
+  return s.players.find(p => p.id === target)?.name ?? s.cards[target]?.data.name ?? '?';
+}
+
+function declareAttack(s: GameState, ctx: Ctx, actor: string, a: { iid: string; target: string | null; force?: boolean }) {
+  const c = card(s, a.iid);
+  if (c.zone !== 'battlefield' || c.controllerId !== actor) throw new RuleError('Só dá para atacar com as suas criaturas no campo.');
+  if (s.turn.activeId !== actor) throw new RuleError('Só o jogador ativo ataca.');
+  // da fase principal, clicar em atacar já leva ao passo de atacantes
+  while (STEPS.indexOf(s.turn.step) < STEPS.indexOf('attackers')) nextStep(s, ctx);
+  if (s.turn.step !== 'attackers') throw new RuleError('Atacantes só são declarados no passo de atacantes.');
+  if (a.target === null) {
+    if (!c.attacking) return;
+    if (c.attackTapped) c.tapped = false;
+    c.attacking = undefined; c.attackTapped = false;
+    for (const b of blockersOf(s, c.iid)) b.blocking = undefined;
+    log(s, ctx, `${c.data.name} não ataca mais`, actor);
+    return;
+  }
+  const def = defenderOf(s, a.target);
+  if (!def || def === actor) throw new RuleError('Escolha um oponente (ou um planeswalker dele) para atacar.');
+  if (player(s, def).lost) throw new RuleError('Esse jogador já está fora da partida.');
+  if (!isType(c, 'creature')) throw new RuleError('Só criaturas atacam.');
+  if (s.settings.enforce && !a.force) {
+    if (has(c, 'defender')) throw new RuleError(`${c.data.name} tem defensor e não pode atacar.`, true);
+    if (c.tapped && !c.attacking) throw new RuleError(`${c.data.name} está virada e não pode atacar.`, true);
+    if (summoningSick(s, c)) throw new RuleError(`${c.data.name} entrou neste turno e não pode atacar (precisa de ímpeto).`, true);
+  }
+  if (!c.attacking && !has(c, 'vigilance') && !c.tapped) { c.tapped = true; c.attackTapped = true; }
+  c.attacking = a.target;
+  log(s, ctx, `${c.data.name} ataca ${targetName(s, a.target)}${has(c, 'vigilance') ? ' (vigilância: não vira)' : ''}`, actor);
+}
+
+function declareBlock(s: GameState, ctx: Ctx, actor: string, a: { iid: string; attacker: string | null; force?: boolean }) {
+  const c = card(s, a.iid);
+  if (c.zone !== 'battlefield' || c.controllerId !== actor) throw new RuleError('Só dá para bloquear com as suas criaturas.');
+  if (s.turn.step !== 'blockers') throw new RuleError('Bloqueadores só são declarados no passo de bloqueadores.');
+  if (a.attacker === null) {
+    if (c.blocking) { log(s, ctx, `${c.data.name} não bloqueia mais`, actor); c.blocking = undefined; }
+    return;
+  }
+  const atk = card(s, a.attacker);
+  if (!atk.attacking) throw new RuleError(`${atk.data.name} não está atacando.`);
+  if (defenderOf(s, atk.attacking) !== actor) throw new RuleError(`${atk.data.name} não está atacando você.`);
+  if (!isType(c, 'creature')) throw new RuleError('Só criaturas bloqueiam.');
+  if (s.settings.enforce && !a.force) {
+    if (c.tapped) throw new RuleError(`${c.data.name} está virada e não pode bloquear.`, true);
+    if (has(atk, 'flying') && !has(c, 'flying') && !has(c, 'reach'))
+      throw new RuleError(`${atk.data.name} tem voar: só criaturas com voar ou alcance a bloqueiam.`, true);
+  }
+  c.blocking = atk.iid;
+  log(s, ctx, `${c.data.name} bloqueia ${atk.data.name}`, actor);
+}
+
+interface Hit { source: CardInst; to: { card?: CardInst; player?: PlayerState }; amount: number }
+
+/** Passo de dano: com iniciativa/golpe duplo há duas rodadas, com as ações baseadas em estado entre elas. */
+function combatDamage(s: GameState, ctx: Ctx) {
+  const atk = attackersOf(s);
+  if (!atk.length) return;
+  const all = [...atk, ...atk.flatMap(a => blockersOf(s, a.iid))];
+  const anyFirst = all.some(c => has(c, 'first strike') || has(c, 'double strike'));
+  if (anyFirst) {
+    dealCombatDamage(s, ctx, 'first');
+    stateBasedActions(s, ctx);
+  }
+  dealCombatDamage(s, ctx, anyFirst ? 'regular' : 'all');
+}
+
+function dealsIn(c: CardInst, pass: 'first' | 'regular' | 'all') {
+  if (pass === 'all') return true;
+  const fs = has(c, 'first strike'), ds = has(c, 'double strike');
+  return pass === 'first' ? fs || ds : !fs || ds;
+}
+
+function dealCombatDamage(s: GameState, ctx: Ctx, pass: 'first' | 'regular' | 'all') {
+  const hits: Hit[] = [];
+  const alive = (iid: string) => s.cards[iid]?.zone === 'battlefield';
+  for (const a of attackersOf(s)) {
+    if (!dealsIn(a, pass)) continue;
+    const power = Math.max(0, effectivePT(a)?.[0] ?? 0);
+    if (!power) continue;
+    const defId = defenderOf(s, a.attacking!);
+    const toDefender = (n: number) => {
+      if (n <= 0) return;
+      const pw = s.cards[a.attacking!];
+      if (pw && pw.zone === 'battlefield') hits.push({ source: a, to: { card: pw }, amount: n });
+      else if (defId) hits.push({ source: a, to: { player: player(s, defId) }, amount: n });
+    };
+    const wasBlocked = (a.blockedBy?.length ?? 0) > 0;
+    const blockers = (a.blockedBy ?? []).filter(alive).map(i => s.cards[i]).filter(b => b.blocking === a.iid);
+    if (!wasBlocked) { toDefender(power); continue; }
+    if (!blockers.length) { if (has(a, 'trample')) toDefender(power); continue; }
+    // 510.1c: dano letal em cada bloqueador, na ordem; com atropelar o resto vai para o defensor
+    let left = power;
+    const trample = has(a, 'trample'), dt = has(a, 'deathtouch');
+    blockers.forEach((b, i) => {
+      if (left <= 0) return;
+      const tough = effectivePT(b)?.[1] ?? 0;
+      const lethal = dt ? 1 : Math.max(0, tough - (b.damage ?? 0));
+      const last = i === blockers.length - 1;
+      const give = last && !trample ? left : Math.min(left, Math.max(lethal, 0));
+      if (give > 0) hits.push({ source: a, to: { card: b }, amount: give });
+      left -= give;
+    });
+    if (left > 0 && trample) toDefender(left);
+  }
+  for (const a of attackersOf(s)) for (const b of blockersOf(s, a.iid)) {
+    if (!dealsIn(b, pass)) continue;
+    const power = Math.max(0, effectivePT(b)?.[0] ?? 0);
+    if (power && a.zone === 'battlefield') hits.push({ source: b, to: { card: a }, amount: power });
+  }
+  if (!hits.length) return;
+  // todo o dano da rodada é causado ao mesmo tempo (510.2)
+  const lines: string[] = [];
+  for (const h of hits) {
+    const src = h.source;
+    if (h.to.card) {
+      const t = h.to.card;
+      if (isType(t, 'planeswalker') && !isType(t, 'creature')) {
+        setCounter(t, 'loyalty', (t.counters['loyalty'] ?? num(t.data.loyalty)) - h.amount);
+      } else {
+        t.damage = (t.damage ?? 0) + h.amount;
+        if (has(src, 'deathtouch')) t.deathtouched = true;
+      }
+      lines.push(`${src.data.name} causou ${h.amount} a ${t.data.name}`);
+    } else if (h.to.player) {
+      const p = h.to.player;
+      p.life -= h.amount;
+      if (src.isCommander) p.cmdDamage[src.iid] = (p.cmdDamage[src.iid] ?? 0) + h.amount;
+      lines.push(`${src.data.name} causou ${h.amount} a ${p.name}${src.isCommander ? ` (dano de comandante: ${p.cmdDamage[src.iid]}/21)` : ''}`);
+    }
+    if (has(src, 'lifelink')) {
+      const ctrl = player(s, src.controllerId);
+      ctrl.life += h.amount;
+      lines.push(`${ctrl.name} ganhou ${h.amount} de vida (vínculo com a vida)`);
+    }
+  }
+  log(s, ctx, `Dano de combate${pass === 'first' ? ' (iniciativa)' : ''}: ${lines.join('; ')}`);
+}
+
+function endCombat(s: GameState) {
+  for (const iid of s.battlefield) {
+    const c = s.cards[iid];
+    c.attacking = undefined; c.attackTapped = false; c.blocking = undefined; c.blockedBy = undefined;
+  }
+}
+
+// ---------- alvos: resistência a magia e salvaguarda ----------
+
+/** Confere os alvos antes de qualquer custo ser pago (resistência a magia). */
+function validateTargets(s: GameState, actor: string, targets: string[]) {
+  for (const t of targets) {
+    const c = s.cards[t];
+    if (c && c.controllerId !== actor && has(c, 'hexproof'))
+      throw new RuleError(`${c.data.name} tem resistência a magia: oponentes não podem escolhê-la como alvo.`, true);
+  }
+}
+
+function checkTargets(s: GameState, ctx: Ctx, actor: string, spell: CardInst, targets: string[], force?: boolean) {
+  const valid: string[] = [];
+  for (const t of targets.slice(0, 10)) {
+    if (s.players.some(p => p.id === t)) { valid.push(t); continue; }
+    const c = s.cards[t];
+    if (!c || (c.zone !== 'battlefield' && c.zone !== 'stack')) throw new RuleError('Um dos alvos não está mais disponível.');
+    if (s.settings.enforce && !force && c.controllerId !== actor && has(c, 'hexproof'))
+      throw new RuleError(`${c.data.name} tem resistência a magia: oponentes não podem escolhê-la como alvo.`, true);
+    valid.push(t);
+  }
+  spell.targets = valid;
+  if (valid.length) log(s, ctx, `${spell.data.name} tem como alvo: ${valid.map(t => targetName(s, t)).join(', ')}`, actor);
+  // 702.21a: salvaguarda dispara para cada permanente de oponente escolhida como alvo
+  if (!s.settings.enforce) return;
+  const me = player(s, actor);
+  for (const t of valid) {
+    const c = s.cards[t];
+    if (!c || c.zone !== 'battlefield' || c.controllerId === actor) continue;
+    const w = wardOf(c);
+    if (!w) continue;
+    me.prompts.push({ id: ctx.id(), kind: 'ward', iid: spell.iid, ward: c.iid, cost: w.text, mana: w.mana, life: w.life });
+    log(s, ctx, `Salvaguarda de ${c.data.name}: ${me.name} paga ${w.text} ou ${spell.data.name} é anulada`, actor);
+  }
+}
+
+function resolveWard(s: GameState, ctx: Ctx, actor: string, pr: Extract<import('./types.js').Prompt, { kind: 'ward' }>, accept: boolean, force?: boolean) {
+  const spell = s.cards[pr.iid];
+  if (!spell || spell.zone !== 'stack') return; // já resolveu ou saiu da pilha
+  const me = player(s, actor);
+  const wardName = s.cards[pr.ward]?.data.name ?? 'a permanente';
+  if (accept) {
+    if (pr.mana && !force) {
+      const plan = planPayment(parseCost(pr.mana), 0, 0, me.pool as any, manaSources(s, actor), me.life);
+      if ('missing' in plan) throw new RuleError(`Mana insuficiente para a salvaguarda (${pr.mana}): falta ${plan.missing}.`, true);
+      for (const t of plan.taps) s.cards[t.iid].tapped = true;
+      me.pool = plan.pool;
+    }
+    if (pr.life) me.life -= pr.life;
+    log(s, ctx, `${me.name} pagou a salvaguarda de ${wardName} (${pr.cost})`, actor);
+  } else {
+    log(s, ctx, `${spell.data.name} foi anulada pela salvaguarda de ${wardName}`, actor);
+    me.prompts = me.prompts.filter(q => !(q.kind === 'ward' && q.iid === spell.iid));
+    if (spell.ability) { s.stack.splice(s.stack.indexOf(spell.iid), 1); delete s.cards[spell.iid]; }
+    else moveCard(s, ctx, spell.controllerId, spell.iid, 'graveyard', { quiet: true });
+  }
 }
 
 function resolveTop(s: GameState, ctx: Ctx, actor: string) {
@@ -367,7 +626,7 @@ export function commanderIdentity(s: GameState, pid: string): string[] {
 }
 
 export function summoningSick(s: GameState, c: CardInst) {
-  return isType(c, 'creature') && c.enteredTurn === s.turn.number && !hasHaste(c.data.oracle);
+  return isType(c, 'creature') && c.enteredTurn === s.turn.number && !has(c, 'haste');
 }
 
 /** Fontes de mana que o jogador pode virar agora. */
@@ -391,7 +650,7 @@ function checkTiming(s: GameState, actor: string, c: CardInst, to: ZoneName, a: 
     throw new RuleError(`${name} precisa ser conjurada: arraste para a pilha ou dê duplo clique.`, true);
   if (to === 'stack' && !c.ability && c.zone !== 'battlefield' && c.zone !== 'stack') {
     if (isLand(c)) throw new RuleError('Terreno não se conjura: baixe direto no campo.', true);
-    const instant = frontType(c.data.typeLine).toLowerCase().includes('instant') || hasFlash(c.data.oracle);
+    const instant = frontType(c.data.typeLine).toLowerCase().includes('instant') || has(c, 'flash');
     if (!instant && !(s.turn.activeId === actor && isMain(s) && s.stack.length === 0))
       throw new RuleError(`${name} só pode ser conjurada na sua fase principal, com a pilha vazia.`, true);
   }
@@ -528,11 +787,44 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
         assertCanTouch(s, actor, c);
         if (s.settings.enforce && !a.force) {
           checkTiming(s, actor, c, a.to, a);
+          if (a.to === 'stack' && a.targets?.length) validateTargets(s, actor, a.targets);
           if (a.to === 'stack' && !c.ability && c.zone !== 'battlefield' && c.zone !== 'stack') payFor(s, ctx, actor, c, a.xValue);
         }
         // Zonas privadas e cemitério/exílio sempre são do dono; no campo, o destino escolhido vira controlador.
+        const casting = a.to === 'stack' && c.zone !== 'stack';
         moveCard(s, ctx, actor, iid, a.to, { position: a.position, x: a.x, y: a.y, faceDown: a.faceDown, toPlayer });
+        if (casting && a.targets?.length && s.cards[iid]) checkTargets(s, ctx, actor, s.cards[iid], a.targets, a.force);
       }
+      return;
+    }
+    case 'attack': declareAttack(s, ctx, actor, a); return;
+    case 'block': declareBlock(s, ctx, actor, a); return;
+    case 'destroy': {
+      for (const iid of a.iids) {
+        const c = card(s, iid);
+        if (c.zone !== 'battlefield') continue;
+        if (has(c, 'indestructible')) { log(s, ctx, `${c.data.name} é indestrutível e não foi destruída`, actor); continue; }
+        log(s, ctx, `${me.name} destruiu ${cardName(c)}`, actor);
+        moveCard(s, ctx, actor, iid, 'graveyard', { quiet: true });
+      }
+      return;
+    }
+    case 'damage': {
+      // dano fora do combate (raio, efeitos): qualquer jogador marca, as ações baseadas em estado decidem
+      const c = card(s, a.iid);
+      if (c.zone !== 'battlefield') throw new RuleError('Só permanentes no campo recebem dano.');
+      c.damage = Math.max(0, (c.damage ?? 0) + a.delta);
+      log(s, ctx, `${me.name} marcou ${a.delta > 0 ? `${a.delta} de dano em` : `${-a.delta} de dano a menos em`} ${cardName(c)} (${c.damage})`, actor);
+      return;
+    }
+    case 'keyword': {
+      const c = card(s, a.iid); assertCanTouch(s, actor, c);
+      if (!(KEYWORDS as readonly string[]).includes(a.kw)) throw new RuleError('Habilidade desconhecida.');
+      c.kw = { ...(c.kw ?? {}) };
+      if (a.mode === 'reset') delete c.kw[a.kw]; else c.kw[a.kw] = a.mode;
+      const label = KW_LABEL[a.kw as Keyword];
+      log(s, ctx, a.mode === 'off' ? `${cardName(c)} perdeu ${label.toLowerCase()}` : a.mode === 'reset' ? `${cardName(c)}: ${label.toLowerCase()} voltou ao normal`
+        : `${cardName(c)} ganhou ${label.toLowerCase()}${a.mode === 'eot' ? ' até o fim do turno' : ''}`, actor);
       return;
     }
     case 'tap': {
@@ -590,9 +882,10 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
     }
     case 'pt': {
       const c = card(s, a.iid); assertCanTouch(s, actor, c);
-      c.ptMod = [c.ptMod[0] + a.dp, c.ptMod[1] + a.dt];
+      if (a.perm) { const pp = c.ptPerm ?? [0, 0]; c.ptPerm = [pp[0] + a.dp, pp[1] + a.dt]; }
+      else c.ptMod = [c.ptMod[0] + a.dp, c.ptMod[1] + a.dt];
       const pt = effectivePT(c);
-      log(s, ctx, `${cardName(c)} agora é ${pt ? `${pt[0]}/${pt[1]}` : `${c.ptMod[0]}/${c.ptMod[1]}`} até o fim do turno`, actor);
+      log(s, ctx, `${cardName(c)} agora é ${pt ? `${pt[0]}/${pt[1]}` : `${c.ptMod[0]}/${c.ptMod[1]}`}${a.perm ? '' : ' até o fim do turno'}`, actor);
       return;
     }
     case 'attach': {
@@ -650,6 +943,7 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
       }, 'stack');
       c.ability = true; s.cards[iid] = c; s.stack.push(iid);
       log(s, ctx, `${me.name} pôs na pilha: ${c.data.name}`, actor);
+      if (a.targets?.length) checkTargets(s, ctx, actor, c, a.targets, a.force);
       if (s.settings.priority) resetPasses(s, actor);
       return;
     }
@@ -684,6 +978,11 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
     case 'prompt': {
       const pr = me.prompts.find(q => q.id === a.promptId);
       if (!pr) return;
+      if (pr.kind === 'ward') {
+        resolveWard(s, ctx, actor, pr, a.accept, a.force);
+        me.prompts = me.prompts.filter(q => q.id !== a.promptId);
+        return;
+      }
       me.prompts = me.prompts.filter(q => q.id !== a.promptId);
       const c = s.cards[pr.iid];
       if (a.accept && c && c.zone === pr.from) {
@@ -693,7 +992,7 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
       }
       return;
     }
-    case 'nextStep': assertTurnOwner(s, actor); nextStep(s, ctx); return;
+    case 'nextStep': assertTurnOwner(s, actor); nextStep(s, ctx, a.force); return;
     case 'setStep': {
       assertTurnOwner(s, actor);
       const target = STEPS.indexOf(a.step), cur = STEPS.indexOf(s.turn.step);
@@ -704,6 +1003,7 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
     }
     case 'endTurn': {
       assertTurnOwner(s, actor);
+      endCombat(s);
       enterStep(s, ctx, 'cleanup');
       passTurnTo(s, ctx, nextAlive(s, actor));
       return;

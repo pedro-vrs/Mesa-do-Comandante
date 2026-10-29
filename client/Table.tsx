@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Action, CardInst, CardData, GameView, PlayerState, Step, ZoneName } from '../shared/types';
 import { STEPS, STEP_LABEL, ZONE_LABEL } from '../shared/types';
-import { commanderIdentity, isLand, isType, warnings } from '../shared/game';
+import { attackersOf, blockersOf, commanderIdentity, isLand, isType, warnings } from '../shared/game';
+import { KEYWORDS, KW_LABEL, keywordsOf, type Keyword } from '../shared/keywords';
 import { MANA, MANA_NAME, manaOptions, parseCost, poolTotal, type Mana } from '../shared/mana';
 import { getPref, setPref } from './decks';
 import type { Room } from './net';
@@ -23,6 +24,9 @@ export function Table({ room }: { room: Room }) {
   const [selected, setSelected] = useState<string[]>([]);
   const [preview, setPreview] = useState<CardInst | null>(null);
   const [attachFrom, setAttachFrom] = useState<string | null>(null);
+  const [blockFrom, setBlockFrom] = useState<string | null>(null);
+  /** Escolhendo alvos para uma mágica (iid) ou habilidade (text) antes de pôr na pilha. */
+  const [targeting, setTargeting] = useState<{ label: string; picks: string[]; iid?: string; xValue?: number; text?: string; sourceIid?: string } | null>(null);
   const [ghost, setGhost] = useState<{ iid: string; x: number; y: number; w: number; h: number } | null>(null);
   const [drawer, setDrawer] = useState(false);
   const [oppFocus, setOppFocus] = useState(0);
@@ -45,11 +49,52 @@ export function Table({ room }: { room: Room }) {
   const ask = (title: string, label: string, initial: string, onOk: (v: string) => void) => setModal({ kind: 'ask', title, label, initial, onOk });
   const toggleSide = () => setSideOpen(o => { setPref('side', o ? 'closed' : 'open'); return !o; });
 
-  /** Conjurar: vai para a pilha; com as regras ligadas o custo é pago sozinho. Pergunta X quando tem. */
-  const cast = (c: CardInst) => {
+  /** Conjurar: vai para a pilha; com as regras ligadas o custo é pago sozinho. Pergunta X e, se o texto pede alvo, os alvos. */
+  const needsTarget = (c: CardInst) => /\btarget\b|\balvo\b/i.test(c.data.oracle.split('\n//\n')[c.transformed ? 1 : 0] ?? '');
+  const castWith = (c: CardInst, xValue?: number, forceTargets = false) => {
+    if (forceTargets || needsTarget(c)) {
+      setTargeting({ label: c.data.name, picks: [], iid: c.iid, xValue });
+      room.setToast(`Escolha os alvos de ${c.data.name}: clique nas cartas ou no nome dos jogadores.`);
+    } else act({ type: 'move', iids: [c.iid], to: 'stack', xValue });
+  };
+  const cast = (c: CardInst, forceTargets = false) => {
     if (v.settings.enforce && parseCost(c.data.manaCost).x)
-      ask(`Conjurar ${c.data.name}`, 'Valor de X', '1', n => act({ type: 'move', iids: [c.iid], to: 'stack', xValue: Math.max(0, Math.floor(Number(n)) || 0) }));
-    else act({ type: 'move', iids: [c.iid], to: 'stack' });
+      ask(`Conjurar ${c.data.name}`, 'Valor de X', '1', n => castWith(c, Math.max(0, Math.floor(Number(n)) || 0), forceTargets));
+    else castWith(c, undefined, forceTargets);
+  };
+  const confirmTargets = (withTargets = true) => {
+    if (!targeting) return;
+    const targets = withTargets ? targeting.picks : [];
+    if (targeting.iid) act({ type: 'move', iids: [targeting.iid], to: 'stack', xValue: targeting.xValue, targets });
+    else if (targeting.text) act({ type: 'ability', text: targeting.text, sourceIid: targeting.sourceIid, targets });
+    setTargeting(null);
+  };
+  const pickTarget = (id: string) => setTargeting(t => t && ({ ...t, picks: t.picks.includes(id) ? t.picks.filter(x => x !== id) : [...t.picks, id] }));
+
+  // ---------- combate ----------
+  const opponentsAlive = v.players.filter(p => p.id !== me?.id && !p.lost);
+  const iAmDefending = !!me && attackersOf(v).some(a => a.attacking === me.id || v.cards[a.attacking!]?.controllerId === me.id);
+  const attackMenu = (c: CardInst, x: number, y: number): MenuItem[] => {
+    const pws = v.battlefield.map(i => v.cards[i]).filter(p => p && p.controllerId !== me?.id && isType(p, 'planeswalker'));
+    return [
+      ...opponentsAlive.map(p => ({ label: `Atacar ${p.name}`, onClick: () => act({ type: 'attack', iid: c.iid, target: p.id }) })),
+      ...pws.map(p => ({ label: `Atacar ${p.data.name} (planeswalker)`, onClick: () => act({ type: 'attack', iid: c.iid, target: p.iid }) })),
+    ];
+  };
+  const toggleAttack = (c: CardInst, x: number, y: number) => {
+    if (c.attacking) { act({ type: 'attack', iid: c.iid, target: null }); return; }
+    const opts = attackMenu(c, x, y);
+    if (opts.length === 1) opts[0].onClick!();
+    else setMenu({ x, y, title: `${c.data.name} ataca quem?`, items: opts });
+  };
+  const keywordItems = (c: CardInst): MenuItem[] => {
+    const now = keywordsOf(c);
+    const missing = KEYWORDS.filter(k => !now.has(k));
+    return [
+      { label: 'Dar até o fim do turno', sub: missing.map(k => ({ label: KW_LABEL[k], onClick: () => act({ type: 'keyword', iid: c.iid, kw: k, mode: 'eot' }) })) },
+      { label: 'Dar sem prazo (ex.: aura, equipamento)', sub: missing.map(k => ({ label: KW_LABEL[k], onClick: () => act({ type: 'keyword', iid: c.iid, kw: k, mode: 'perm' }) })) },
+      ...(now.size ? [{ label: 'Tirar habilidade', sub: [...now].map(k => ({ label: KW_LABEL[k], onClick: () => act({ type: 'keyword', iid: c.iid, kw: k, mode: c.kw?.[k] && c.kw[k] !== 'off' ? 'reset' : 'off' }) })) }] : []),
+    ];
   };
 
   /** Virar: se a carta gera mais de uma cor, pergunta qual. */
@@ -105,6 +150,12 @@ export function Table({ room }: { room: Room }) {
       if (c.zone === 'battlefield') {
         items.push(
           { label: c.tapped ? 'Desvirar' : 'Virar', hint: 'T', onClick: () => tapCards(iids, x, y) },
+          ...(isType(c, 'creature') && v.turn.activeId === me.id && STEPS.indexOf(v.turn.step) <= STEPS.indexOf('attackers')
+            ? (c.attacking ? [{ label: 'Desistir do ataque', onClick: () => act({ type: 'attack', iid: c.iid, target: null }) }] : [{ label: 'Atacar', sub: attackMenu(c, x, y) }]) : []),
+          ...(isType(c, 'creature') && v.turn.step === 'blockers' && iAmDefending
+            ? (c.blocking ? [{ label: 'Parar de bloquear', onClick: () => act({ type: 'block', iid: c.iid, attacker: null }) }]
+              : [{ label: 'Bloquear', sub: attackersOf(v).filter(a => a.attacking === me.id || v.cards[a.attacking!]?.controllerId === me.id).map(a => ({ label: a.data.name, onClick: () => act({ type: 'block', iid: c.iid, attacker: a.iid }) })) }]) : []),
+          { label: 'Habilidades', sub: keywordItems(c) },
           { label: 'Marcador +1/+1', hint: '+', onClick: () => act({ type: 'counter', iid: c.iid, kind: '+1/+1', delta: 1 }) },
           { label: 'Marcador −1/−1', hint: '−', onClick: () => act({ type: 'counter', iid: c.iid, kind: '-1/-1', delta: 1 }) },
           {
@@ -126,7 +177,16 @@ export function Table({ room }: { room: Room }) {
               { label: 'Zerar modificador', onClick: () => act({ type: 'pt', iid: c.iid, dp: -c.ptMod[0], dt: -c.ptMod[1] }) },
             ],
           },
+          {
+            label: 'P/R sem prazo (efeito de outra carta)', sub: [
+              { label: '+1/+1', onClick: () => act({ type: 'pt', iid: c.iid, dp: 1, dt: 1, perm: true }) },
+              { label: '−1/−1', onClick: () => act({ type: 'pt', iid: c.iid, dp: -1, dt: -1, perm: true }) },
+              { label: '+1/+0', onClick: () => act({ type: 'pt', iid: c.iid, dp: 1, dt: 0, perm: true }) },
+              ...(c.ptPerm ? [{ label: 'Zerar', onClick: () => act({ type: 'pt', iid: c.iid, dp: -c.ptPerm![0], dt: -c.ptPerm![1], perm: true }) }] : []),
+            ],
+          },
           { label: 'Habilidade na pilha…', hint: 'A', onClick: () => ask('Habilidade na pilha', 'O que a habilidade faz?', '', t => act({ type: 'ability', text: t, sourceIid: c.iid })) },
+          { label: 'Habilidade com alvo…', onClick: () => ask('Habilidade com alvo', 'O que a habilidade faz?', '', t => { setTargeting({ label: t, picks: [], text: t, sourceIid: c.iid }); room.setToast('Escolha os alvos: clique nas cartas ou no nome dos jogadores.'); }) },
           ...(c.data.imageBack || c.data.backName ? [{ label: 'Transformar', hint: 'R', onClick: () => act({ type: 'transform', iid: c.iid }) }] : []),
           { label: c.faceDown ? 'Revelar' : 'Virar para baixo', hint: 'F', onClick: () => act({ type: 'faceDown', iid: c.iid }) },
           c.attachedTo
@@ -140,6 +200,7 @@ export function Table({ room }: { room: Room }) {
       } else if (c.zone === 'hand') {
         items.push(
           { label: isLand(c) ? 'Baixar terreno' : 'Conjurar (pilha)', hint: 'duplo clique', onClick: () => playFromHand(c) },
+          ...(!isLand(c) ? [{ label: 'Conjurar escolhendo alvo…', onClick: () => cast(c, true) }] : []),
           { label: 'Pôr direto no campo', onClick: () => act({ type: 'move', iids: [c.iid], to: 'battlefield', ...nextSpot(c) }) },
           { label: 'Jogar virada para baixo', onClick: () => act({ type: 'move', iids: [c.iid], to: 'battlefield', faceDown: true, ...nextSpot(c) }) },
           { label: 'Revelar', onClick: () => act({ type: 'reveal', iids: [c.iid] }) },
@@ -158,6 +219,14 @@ export function Table({ room }: { room: Room }) {
         );
       }
     }
+    if (me && c.zone === 'battlefield' && !c.faceDown) {
+      items.push({ divider: true, label: '' },
+        { label: 'Destruir', onClick: () => act({ type: 'destroy', iids: [c.iid] }) },
+        ...(isType(c, 'creature') || isType(c, 'planeswalker') ? [{
+          label: 'Causar dano', sub: [1, 2, 3, 4, 5].map(n => ({ label: `${n}`, onClick: () => act({ type: 'damage', iid: c.iid, delta: n }) }))
+            .concat(c.damage ? [{ label: 'Tirar o dano', onClick: () => act({ type: 'damage', iid: c.iid, delta: -(c.damage ?? 0) }) }] : []),
+        }] : []));
+    }
     if (me && c.isCommander && c.ownerId !== me.id) {
       items.push({ divider: true, label: '' },
         { label: 'Sofri dano deste comandante', sub: [1, 2, 3, 5, 10].map(n => ({ label: `+${n}`, onClick: () => act({ type: 'cmdDamage', commanderIid: c.iid, delta: n }) })) });
@@ -170,7 +239,7 @@ export function Table({ room }: { room: Room }) {
     const mine = v.battlefield.map(i => v.cards[i]).filter(x => x && x.controllerId === me.id);
     const land = isLand(c);
     const row = mine.filter(x => isLand(x) === land).length;
-    return { x: 0.02 + (row % 12) * 0.08, y: land ? 0.72 - Math.floor(row / 12) * 0.08 : 0.06 + Math.floor(row / 12) * 0.1 };
+    return { x: 0.02 + (row % 9) * 0.11, y: land ? 0.72 - Math.floor(row / 9) * 0.08 : 0.08 + Math.floor(row / 9) * 0.14 };
   };
 
   const playFromHand = (c: CardInst) => {
@@ -256,6 +325,29 @@ export function Table({ room }: { room: Room }) {
   });
 
   const clickCard = (c: CardInst, multi: boolean) => {
+    if (targeting) {
+      if (c.zone === 'battlefield' || c.zone === 'stack') pickTarget(c.iid);
+      return;
+    }
+    if (blockFrom) {
+      if (c.attacking) act({ type: 'block', iid: blockFrom, attacker: c.iid });
+      else room.setToast('Clique numa criatura que está atacando.');
+      setBlockFrom(null); return;
+    }
+    if (me && c.zone === 'battlefield' && c.controllerId === me.id && isType(c, 'creature') && !multi) {
+      // passo de atacantes: clicar na criatura declara (ou desfaz) o ataque
+      if (v.turn.step === 'attackers' && v.turn.activeId === me.id) { toggleAttack(c, lastPointer.current.x, lastPointer.current.y); return; }
+      // passo de bloqueadores: clicar na sua criatura e depois no atacante
+      if (v.turn.step === 'blockers' && iAmDefending) {
+        if (c.blocking) act({ type: 'block', iid: c.iid, attacker: null });
+        else {
+          const mine = attackersOf(v).filter(a => a.attacking === me.id || v.cards[a.attacking!]?.controllerId === me.id);
+          if (mine.length === 1) act({ type: 'block', iid: c.iid, attacker: mine[0].iid });
+          else { setBlockFrom(c.iid); room.setToast(`Agora clique no atacante que ${c.data.name} vai bloquear.`); }
+        }
+        return;
+      }
+    }
     if (attachFrom) {
       if (attachFrom !== c.iid) act({ type: 'attach', iid: attachFrom, to: c.iid });
       setAttachFrom(null); return;
@@ -301,7 +393,7 @@ export function Table({ room }: { room: Room }) {
         case 'a': if (h && mineH) ask('Habilidade na pilha', 'O que a habilidade faz?', '', txt => act({ type: 'ability', text: txt, sourceIid: h.iid })); break;
         case '+': case '=': if (h && mineH) act({ type: 'counter', iid: h.iid, kind: '+1/+1', delta: 1 }); break;
         case '-': if (h && mineH) act({ type: 'counter', iid: h.iid, kind: '-1/-1', delta: 1 }); break;
-        case 'escape': setSelected([]); setAttachFrom(null); break;
+        case 'escape': setSelected([]); setAttachFrom(null); setBlockFrom(null); setTargeting(null); break;
         default: return;
       }
     };
@@ -324,7 +416,7 @@ export function Table({ room }: { room: Room }) {
   const focusOpp = seatOrder[Math.min(oppFocus, seatOrder.length - 1)];
 
   return (
-    <div className={`table ${attachFrom ? 'attaching' : ''} ${sideOpen ? '' : 'side-closed'} opp-${Math.min(seatOrder.length, 5)}`} onContextMenu={e => e.preventDefault()}>
+    <div className={`table ${attachFrom || blockFrom || targeting ? 'attaching' : ''} ${targeting ? 'targeting' : ''} ${sideOpen ? '' : 'side-closed'} opp-${Math.min(seatOrder.length, 5)}`} onContextMenu={e => e.preventDefault()}>
       <div className="opponents">
         {seatOrder.length > 1 && (
           <div className="opp-tabs" role="tablist" aria-label="Oponentes">
@@ -332,8 +424,8 @@ export function Table({ room }: { room: Room }) {
           </div>
         )}
         {seatOrder.map(p => (
-          <Mat key={p.id} p={p} v={v} compact me={me} focused={p.id === focusOpp?.id} warnIds={warnIds} selected={selected} cardProps={cardProps} act={act}
-            onZone={(zone) => setModal({ kind: 'zone', playerId: p.id, zone })} onLibrary={() => {}} />
+          <Mat key={p.id} p={p} v={v} compact me={me} focused={p.id === focusOpp?.id} warnIds={warnIds} selected={targeting ? targeting.picks : selected} cardProps={cardProps} act={act}
+            onZone={(zone) => setModal({ kind: 'zone', playerId: p.id, zone })} onLibrary={() => {}} onPickPlayer={targeting ? pickTarget : undefined} />
         ))}
       </div>
 
@@ -345,8 +437,8 @@ export function Table({ room }: { room: Room }) {
         )}
       </TurnRail>
 
-      <Mat p={mainPlayer} v={v} me={me} focused warnIds={warnIds} selected={selected} cardProps={cardProps} act={act}
-        onZone={(zone) => setModal({ kind: 'zone', playerId: mainPlayer.id, zone })} onLibrary={libraryMenu} onMana={manaMenu} isMain />
+      <Mat p={mainPlayer} v={v} me={me} focused warnIds={warnIds} selected={targeting ? targeting.picks : selected} cardProps={cardProps} act={act}
+        onZone={(zone) => setModal({ kind: 'zone', playerId: mainPlayer.id, zone })} onLibrary={libraryMenu} onMana={manaMenu} isMain onPickPlayer={targeting ? pickTarget : undefined} />
 
       {me && (
         <div className="hand" data-drop="hand" data-owner={me.id}>
@@ -400,11 +492,11 @@ export function Table({ room }: { room: Room }) {
           <button className="btn ghost small side-close" onClick={() => setDrawer(false)}>Fechar</button>
         </div>
         <Stack v={v} me={me} act={act} cardProps={cardProps} />
-        {prompts.map(pr => {
+        {prompts.filter(pr => pr.kind === 'commander-zone').map(pr => {
           const c = v.cards[pr.iid];
           return (
             <div key={pr.id} className="prompt" role="alert">
-              <p><b>{c?.data.name ?? 'Seu comandante'}</b> foi para {ZONE_LABEL[pr.from]}. Voltar para a zona de comando?</p>
+              <p><b>{c?.data.name ?? 'Seu comandante'}</b> foi para {ZONE_LABEL[pr.from!]}. Voltar para a zona de comando?</p>
               <div className="row">
                 <button className="btn primary" onClick={() => act({ type: 'prompt', promptId: pr.id, accept: true })}>Voltar</button>
                 <button className="btn ghost" onClick={() => act({ type: 'prompt', promptId: pr.id, accept: false })}>Deixar</button>
@@ -423,6 +515,30 @@ export function Table({ room }: { room: Room }) {
       </aside>
       {drawer && <div className="drawer-back" onPointerDown={() => setDrawer(false)} />}
 
+      {/* decisões que não podem esperar: ficam por cima da mesa */}
+      {targeting && (
+        <div className="action-banner" role="region" aria-label="Escolher alvos">
+          <span>Alvos de <b>{targeting.label}</b>: {targeting.picks.length ? targeting.picks.map(t => v.players.find(p => p.id === t)?.name ?? v.cards[t]?.data.name).join(', ') : 'clique nas cartas ou no nome dos jogadores'}</span>
+          <span className="row">
+            <button className="btn primary small" disabled={!targeting.picks.length} onClick={() => confirmTargets(true)}>Confirmar alvos</button>
+            <button className="btn small" onClick={() => confirmTargets(false)}>Sem alvo</button>
+            <button className="btn ghost small" onClick={() => setTargeting(null)}>Cancelar</button>
+          </span>
+        </div>
+      )}
+      {!targeting && prompts.filter(pr => pr.kind === 'ward').slice(0, 1).map(pr => {
+        const w = pr as Extract<typeof pr, { kind: 'ward' }>;
+        return (
+          <div key={w.id} className="action-banner ward" role="alert">
+            <span>Salvaguarda de <b>{v.cards[w.ward]?.data.name ?? 'uma permanente'}</b>: pague <b>{w.cost}</b> ou <b>{v.cards[w.iid]?.data.name}</b> é anulada.</span>
+            <span className="row">
+              <button className="btn primary small" onClick={() => act({ type: 'prompt', promptId: w.id, accept: true })}>Pagar</button>
+              <button className="btn ghost small" onClick={() => act({ type: 'prompt', promptId: w.id, accept: false })}>Deixar anular</button>
+            </span>
+          </div>
+        );
+      })}
+
 
       {ghost && v.cards[ghost.iid] && (
         <div className="card ghost" style={{ left: ghost.x, top: ghost.y, width: ghost.w, height: ghost.h }}><CardFace c={v.cards[ghost.iid]} /></div>
@@ -431,7 +547,7 @@ export function Table({ room }: { room: Room }) {
       {menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
 
       {modal?.kind === 'zone' && <ZoneView v={v} me={me} playerId={modal.playerId} zone={modal.zone} onClose={() => setModal(null)} openMenu={openCardMenu} />}
-      {modal?.kind === 'peek' && <PeekView cards={modal.cards} all={modal.all} act={act} onClose={() => setModal(null)} />}
+      {modal?.kind === 'peek' && <PeekView cards={modal.cards} all={modal.all} act={act} onClose={() => setModal(null)} spot={nextSpot} />}
       {modal?.kind === 'token' && <TokenMaker act={act} onClose={() => setModal(null)} />}
       {modal?.kind === 'preview' && (
         <Modal title={modal.c.data.name} onClose={() => setModal(null)}>
@@ -468,10 +584,11 @@ export function Table({ room }: { room: Room }) {
 
 type CardPropsFn = (c: CardInst) => Record<string, any>;
 
-function Mat({ p, v, me, compact, focused, isMain, warnIds, selected, cardProps, act, onZone, onLibrary, onMana }: {
+function Mat({ p, v, me, compact, focused, isMain, warnIds, selected, cardProps, act, onZone, onLibrary, onMana, onPickPlayer }: {
   p: PlayerState; v: GameView; me?: PlayerState; compact?: boolean; focused?: boolean; isMain?: boolean; warnIds: Set<string>; selected: string[];
   cardProps: CardPropsFn; act: (a: Action) => Promise<boolean>; onZone: (z: 'graveyard' | 'exile') => void; onLibrary: (x: number, y: number) => void;
   onMana?: (x: number, y: number) => void;
+  onPickPlayer?: (id: string) => void;
 }) {
   const isMe = me?.id === p.id;
   const active = v.turn.activeId === p.id;
@@ -484,7 +601,8 @@ function Mat({ p, v, me, compact, focused, isMain, warnIds, selected, cardProps,
   return (
     <section className={`mat ${compact ? 'compact' : 'main'} ${focused ? 'focused' : ''} ${active ? 'active' : ''} ${p.lost ? 'lost' : ''}`} style={{ '--seat': p.color } as any} aria-label={`Mesa de ${p.name}`}>
       <header className="mat-head">
-        <div className="who">
+        <div className={`who ${onPickPlayer ? 'pickable-player' : ''} ${selected.includes(p.id) ? 'picked' : ''}`} onClick={() => onPickPlayer?.(p.id)}
+          role={onPickPlayer ? 'button' : undefined} title={onPickPlayer ? `Escolher ${p.name} como alvo` : undefined}>
           <span className="seat-dot" aria-hidden="true" />
           <strong>{p.name}</strong>
           {!p.connected && <span className="tag">desconectado</span>}
@@ -536,10 +654,10 @@ function Mat({ p, v, me, compact, focused, isMain, warnIds, selected, cardProps,
               ...(host ? { translate: '-10% -16%' } : {}),
             } as any;
             return (
-              <div key={c.iid} className={`card on-field ${c.tapped ? 'tapped' : ''} ${selected.includes(c.iid) ? 'selected' : ''} ${warnIds.has(c.iid) ? 'warn' : ''} ${c.controllerId !== c.ownerId ? 'stolen' : ''}`}
+              <div key={c.iid} className={`card on-field ${c.tapped ? 'tapped' : ''} ${c.attacking ? 'attacking' : ''} ${c.blocking ? 'blocking' : ''} ${selected.includes(c.iid) ? 'selected' : ''} ${warnIds.has(c.iid) ? 'warn' : ''} ${c.controllerId !== c.ownerId ? 'stolen' : ''}`}
                 style={style} {...cardProps(c)} tabIndex={0} aria-label={c.faceDown ? 'Carta virada para baixo' : c.data.name}>
                 <CardFace c={c} />
-                <CardOverlays c={c} />
+                <CardOverlays c={c} combat={c.attacking ? `ataca ${v.players.find(q => q.id === c.attacking)?.name ?? v.cards[c.attacking]?.data.name ?? ''}` : c.blocking ? `bloqueia ${v.cards[c.blocking]?.data.name ?? ''}` : undefined} />
               </div>
             );
           })}
@@ -606,6 +724,10 @@ function TurnRail({ v, me, act, children }: { v: GameView; me?: PlayerState; act
   const active = v.players.find(p => p.id === v.turn.activeId);
   const mine = me?.id === v.turn.activeId;
   const prio = v.players.find(p => p.id === v.turn.priorityId);
+  const defending = !!me && attackersOf(v).some(a => a.attacking === me.id || v.cards[a.attacking!]?.controllerId === me.id);
+  const hint = v.turn.step === 'attackers' && mine ? 'Clique nas criaturas que vão atacar; depois, Próximo passo.'
+    : v.turn.step === 'blockers' && defending ? 'Clique na sua criatura para bloquear (e no atacante, se houver mais de um).'
+    : v.turn.step === 'blockers' && mine ? 'Esperando os bloqueios; depois, Próximo passo para o dano.' : '';
   return (
     <nav className="rail" aria-label="Passos do turno" style={{ '--seat': active?.color } as any}>
       <div className="rail-who"><span className="seat-dot" />Turno {v.turn.number} · <strong>{active?.name}</strong></div>
@@ -619,6 +741,7 @@ function TurnRail({ v, me, act, children }: { v: GameView; me?: PlayerState; act
           </li>
         ))}
       </ol>
+      {hint && <span className="rail-hint">{hint}</span>}
       <div className="rail-actions">
         {v.settings.priority && me && (
           <button className="btn prio-btn" disabled={v.turn.priorityId !== me.id} onClick={() => act({ type: 'pass' })} title="Passar prioridade (espaço)">
@@ -656,7 +779,7 @@ function Stack({ v, me, act, cardProps }: { v: GameView; me?: PlayerState; act: 
                 <div className="card in-stack" {...cardProps(c)}><CardFace c={c} /></div>
                 <div className="stack-meta">
                   <strong>{c.data.name}</strong>
-                  <span className="muted small">{owner?.name}</span>
+                  <span className="muted small">{owner?.name}{c.targets?.length ? ` → ${c.targets.map(t => v.players.find(p => p.id === t)?.name ?? v.cards[t]?.data.name ?? '?').join(', ')}` : ''}</span>
                   {i === 0 && me && <button className="btn small primary" onClick={() => act({ type: 'resolve' })}>Resolver</button>}
                 </div>
               </li>
@@ -723,7 +846,7 @@ function ZoneView({ v, me, playerId, zone, onClose, openMenu }: { v: GameView; m
   );
 }
 
-function PeekView({ cards, all, act, onClose }: { cards: CardInst[]; all: boolean; act: (a: Action) => Promise<boolean>; onClose: () => void }) {
+function PeekView({ cards, all, act, onClose, spot }: { cards: CardInst[]; all: boolean; act: (a: Action) => Promise<boolean>; onClose: () => void; spot: (c: CardInst) => { x?: number; y?: number } }) {
   const [list, setList] = useState(cards);
   const [filter, setFilter] = useState('');
   const move = (c: CardInst, to: ZoneName, position?: 'top' | 'bottom', extra: Partial<Action> = {}) => {
@@ -741,7 +864,7 @@ function PeekView({ cards, all, act, onClose }: { cards: CardInst[]; all: boolea
             {!all && <span className="muted small">{i + 1}º do topo</span>}
             <div className="peek-actions">
               <button className="btn small" onClick={() => move(c, 'hand')}>Mão</button>
-              <button className="btn small" onClick={() => move(c, 'battlefield', undefined, { x: 0.4, y: 0.4 })}>Campo</button>
+              <button className="btn small" onClick={() => move(c, 'battlefield', undefined, spot(c))}>Campo</button>
               <button className="btn small" onClick={() => move(c, 'graveyard')}>Cemitério</button>
               <button className="btn small" onClick={() => move(c, 'exile')}>Exílio</button>
               {!all && <button className="btn small" onClick={() => move(c, 'library', 'bottom')}>Fundo</button>}

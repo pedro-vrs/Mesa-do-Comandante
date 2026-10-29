@@ -353,3 +353,25 @@ fieldset { border: 0; padding: 0; margin: 0 0 1rem; }
   .table.side-closed { grid-template-columns: minmax(0, 1fr); }
   .table.side-closed .side { visibility: visible; padding: 8px; border-left: 1px solid var(--line); }
 }
+
+/* ---------- combate e habilidades ---------- */
+.kw-badges { position: absolute; left: 3%; bottom: 3%; display: flex; flex-wrap: wrap; gap: 2px; max-width: 70%; pointer-events: auto; }
+.kw { font: 700 calc(var(--ch) * .085)/1 var(--ui); background: #0d1220d8; color: #e6e1d4; padding: 2px 3px; border-radius: 3px; white-space: nowrap; }
+.kw.granted { background: color-mix(in srgb, var(--brass) 70%, #0d1220); color: #231a05; }
+.pt-badge.hurt { background: #f3c98b; }
+.card.on-field.attacking { translate: 0 -8%; }
+.card.on-field.attacking .face { box-shadow: 0 0 0 2px var(--danger); }
+.card.on-field.blocking .face { box-shadow: 0 0 0 2px #6aa9ff; }
+.combat-mark { position: absolute; left: 50%; top: 4%; translate: -50% 0; font-size: .68rem; padding: 0 .4rem; border-radius: 99px; white-space: nowrap; pointer-events: none; max-width: 180%; overflow: hidden; text-overflow: ellipsis; }
+.combat-mark.atk { background: var(--danger); color: #fff; }
+.combat-mark.blk { background: #3b6fd1; color: #fff; }
+.card.tapped .combat-mark { rotate: -90deg; }
+.rail-hint { font-size: .8rem; color: var(--brass); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 32ch; }
+.action-banner { position: fixed; left: 50%; top: 10px; translate: -50% 0; z-index: 1300; display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; justify-content: center;
+  background: #0d1220; border: 1px solid var(--brass); border-radius: 12px; padding: .55rem .9rem; box-shadow: 0 12px 30px rgb(0 0 0 / .5); max-width: min(760px, 94vw); }
+.action-banner.ward { border-color: #6aa9ff; }
+.table.targeting .card.on-field, .table.targeting .card.in-stack { cursor: crosshair; }
+.table.targeting .card.selected .face { box-shadow: 0 0 0 3px var(--good); }
+.who.pickable-player { cursor: crosshair; outline: 1px dashed var(--good); outline-offset: 3px; border-radius: 6px; }
+.who.picked { outline: 2px solid var(--good); }
+@media (max-width: 900px), (max-height: 560px) { .rail-hint { display: none; } }

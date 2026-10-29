@@ -17,6 +17,13 @@ que não dependem de ler o texto da carta, inspiradas no motor do XMage.
   instantâneas só na sua fase principal com a pilha vazia; conjurar cobra o custo (com imposto e X) e vira os terrenos
   sozinho; virar terreno gera mana na reserva, que esvazia a cada passo; criatura que acabou de entrar não vira por mana.
   Como a mesa não lê o texto de cada carta, toda recusa oferece "Fazer assim mesmo", e isso fica no registro.
+- Combate: clicar nas criaturas declara ataque (no passo de atacantes) e bloqueio (no de bloqueadores); o dano é calculado
+  sozinho, com iniciativa e golpe duplo em duas rodadas; dano letal destrói; dano de comandante é contado no combate.
+- 15 palavras-chave lidas do texto de qualquer carta: voar, alcance, atropelar, iniciativa, golpe duplo, ímpeto, vigilância,
+  vínculo com a vida, toque mortífero, indestrutível, resistência a magia, salvaguarda, lampejo, ameaçar e defensor.
+  Também dá para conceder ou tirar uma habilidade à mão (até o fim do turno ou sem prazo), para efeitos de outras cartas.
+- Alvos: mágicas cujo texto pede alvo abrem a escolha de alvos; resistência a magia recusa o alvo e salvaguarda cobra o custo
+  ou anula a mágica.
 - Modo prioridade opcional, como no XMage: quando todos passam, a pilha resolve ou o turno avança.
 - Desfazer a própria última ação (Ctrl+Z).
 - Informação oculta: mão e grimório dos outros nunca chegam ao seu navegador.
