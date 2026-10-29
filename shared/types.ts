@@ -30,6 +30,8 @@ export interface CardData {
   imageBack?: string;
   backName?: string;
   legalCommander?: string; // 'legal' | 'not_legal' | 'banned' ...
+  set?: string;           // código da coleção (para achar a mesma impressão no XMage)
+  num?: string;           // número de colecionador
 }
 
 export interface CardInst {
@@ -97,13 +99,14 @@ export interface Settings {
   autoDraw: boolean;      // compra automática no passo de compra
   priority: boolean;      // modo XMage: passar prioridade resolve a pilha e avança os passos
   enforce: boolean;       // regras de turno e mana: 1 terreno por turno, tempo de mágica, custo pago
+  mode: 'manual' | 'xmage'; // manual = mesa assistida; xmage = regras completas pelo motor do anfitrião
   maxPlayers: number;
 }
 
 export interface GameState {
   roomId: string;
   version: number;
-  phase: 'lobby' | 'playing' | 'over';
+  phase: 'lobby' | 'playing' | 'over' | 'xmage';
   hostId: string;
   players: PlayerState[];
   cards: Record<string, CardInst>;
@@ -116,7 +119,10 @@ export interface GameState {
 }
 
 /** Versão que um jogador recebe: cartas ocultas ficam de fora de `cards`. */
-export type GameView = GameState & { you?: string; canUndo: boolean; spectators: number };
+export type GameView = GameState & { you?: string; canUndo: boolean; spectators: number; xmage?: EngineInfo };
+
+/** Situação do motor do XMage ligado no computador do anfitrião. */
+export interface EngineInfo { connected: boolean; status: string; error: string; key?: string; version?: string }
 
 export interface DeckEntry { data: CardData; count: number; commander?: boolean }
 
@@ -154,4 +160,5 @@ export type Action =
   | { type: 'rejoin' }
   | { type: 'chat'; text: string }
   | { type: 'reveal'; iids: string[] }
-  | { type: 'restart' };
+  | { type: 'restart' }
+  | { type: 'xmageStart' };

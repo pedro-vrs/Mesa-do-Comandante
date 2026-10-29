@@ -5,12 +5,14 @@ import { randomInt, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { Server, Socket } from 'socket.io';
+import { WebSocketServer, WebSocket } from 'ws';
 import { customAlphabet } from 'nanoid';
 import { addPlayer, newGame, removePlayer, RuleError, step, viewFor, Ctx } from '../shared/game.js';
-import type { Action, GameState, GameView } from '../shared/types.js';
+import type { Action, DeckEntry, GameState, GameView } from '../shared/types.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const roomCode = customAlphabet('abcdefghjkmnpqrstuvwxyz23456789', 6);
+const engineCode = customAlphabet('ABCDEFGHJKMNPQRSTUVWXYZ23456789', 10);
 
 interface Room {
   state: GameState;
@@ -18,6 +20,14 @@ interface Room {
   seats: Map<string, string>;                       // chave secreta do jogador -> id do jogador
   sockets: Map<string, { playerId?: string }>;
   touched: number;
+  // ---- modo XMage ----
+  engineKey: string;                                     // segredo que o motor do anfitrião usa para se ligar
+  engine: WebSocket | null;
+  engineInfo: { status: string; error: string; version?: string };
+  decks: Map<string, { name: string; entries: DeckEntry[] }>;
+  xm: Map<string, { state?: unknown; prompt?: unknown; extra: unknown[] }>; // último estado/decisão por jogador
+  xmLog: { id: number; user: string; text: string; type: string }[];
+  xmStarted: boolean;
 }
 
 const rooms = new Map<string, Room>();
@@ -31,7 +41,10 @@ const ctx: Ctx = {
 function getRoom(id: string): Room {
   let r = rooms.get(id);
   if (!r) {
-    r = { state: newGame(id, ''), history: [], seats: new Map(), sockets: new Map(), touched: Date.now() };
+    r = {
+      state: newGame(id, ''), history: [], seats: new Map(), sockets: new Map(), touched: Date.now(),
+      engineKey: engineCode(), engine: null, engineInfo: { status: '', error: '' }, decks: new Map(), xm: new Map(), xmLog: [], xmStarted: false,
+    };
     rooms.set(id, r);
   }
   r.touched = Date.now();
@@ -59,6 +72,10 @@ function broadcast(roomId: string) {
     const view: GameView = {
       ...viewFor(r.state, info.playerId), you: info.playerId,
       canUndo: !!info.playerId && last?.actor === info.playerId, spectators,
+      xmage: {
+        connected: !!r.engine && r.engine.readyState === WebSocket.OPEN, status: r.engineInfo.status, error: r.engineInfo.error,
+        version: r.engineInfo.version, key: info.playerId && info.playerId === r.state.hostId ? r.engineKey : undefined,
+      },
     };
     io.to(sid).emit('state', view);
   }
@@ -89,6 +106,7 @@ io.on('connection', (socket: Socket) => {
       r.sockets.set(socket.id, { playerId });
       ack({ ok: true, key, playerId, roomId });
       broadcast(roomId);
+      if (r.state.phase === 'xmage') sendXmCache(r, socket.id, playerId);
     } catch (e) {
       ack({ ok: false, error: e instanceof RuleError ? e.message : 'Não foi possível entrar.' });
     }
@@ -98,6 +116,13 @@ io.on('connection', (socket: Socket) => {
     const r = rooms.get(roomId);
     const pid = r?.sockets.get(socket.id)?.playerId;
     if (!r || !pid) return ack?.({ ok: false, error: 'Você está assistindo esta mesa.' });
+    if (a.type === 'start' && r.state.settings.mode === 'xmage') {
+      try { startXmage(r, pid); ack?.({ ok: true }); broadcast(roomId); }
+      catch (e) { ack?.({ ok: false, error: e instanceof RuleError ? e.message : 'Não foi possível começar no XMage.' }); }
+      return;
+    }
+    if (a.type === 'restart' && r.state.phase === 'xmage') { r.engine?.send(JSON.stringify({ t: 'stop' })); r.xmStarted = false; r.xm.clear(); }
+    if (a.type === 'loadDeck') r.decks.set(pid, { name: a.name, entries: a.entries });
     const before = JSON.stringify(r.state);
     try {
       step(r.state, pid, a, ctx);
@@ -148,6 +173,28 @@ io.on('connection', (socket: Socket) => {
     broadcast(roomId);
   });
 
+  // ---- modo XMage: respostas do jogador vão para o motor ----
+  socket.on('xmresp', (msg: { kind: string; value?: string | number | boolean | null }) => {
+    const r = rooms.get(roomId);
+    const pid = r?.sockets.get(socket.id)?.playerId;
+    if (!r || !pid || !r.engine) return;
+    const c = r.xm.get(pid);
+    if (c) c.prompt = undefined;
+    r.engine.send(JSON.stringify({ t: 'resp', pid, kind: String(msg.kind), value: msg.value === undefined || msg.value === null ? null : String(msg.value) }));
+  });
+  socket.on('xmchat', (text: string) => {
+    const r = rooms.get(roomId);
+    const pid = r?.sockets.get(socket.id)?.playerId;
+    if (!r || !pid || !r.engine || typeof text !== 'string' || !text.trim()) return;
+    r.engine.send(JSON.stringify({ t: 'chat', pid, text: text.trim().slice(0, 300) }));
+  });
+  socket.on('xmresync', () => {
+    const r = rooms.get(roomId);
+    const pid = r?.sockets.get(socket.id)?.playerId;
+    if (!r) return;
+    sendXmCache(r, socket.id, pid);
+  });
+
   socket.on('disconnect', () => {
     const r = rooms.get(roomId);
     if (!r) return;
@@ -167,6 +214,92 @@ io.on('connection', (socket: Socket) => {
       }, 120_000).unref();
     }
     broadcast(roomId);
+  });
+});
+
+// ---------- motor do XMage (computador do anfitrião) ----------
+
+function sendXmCache(r: Room, sid: string, pid?: string) {
+  io.to(sid).emit('xmlog', r.xmLog.slice(-200));
+  const c = pid ? r.xm.get(pid) : undefined;
+  if (c?.state) io.to(sid).emit('xm', { kind: 'state', game: c.state });
+  for (const e of c?.extra ?? []) io.to(sid).emit('xm', e);
+  if (c?.prompt) io.to(sid).emit('xm', { kind: 'prompt', prompt: c.prompt });
+}
+
+function startXmage(r: Room, actor: string) {
+  const s = r.state;
+  if (actor !== s.hostId) throw new RuleError('Só quem criou a mesa começa a partida.');
+  if (!r.engine || r.engine.readyState !== WebSocket.OPEN) throw new RuleError('O motor do XMage não está ligado. Abra o Motor da Mesa no seu computador.');
+  if (s.players.length < 2) throw new RuleError('O XMage precisa de pelo menos 2 jogadores.');
+  const missing = s.players.filter(p => !r.decks.has(p.id)).map(p => p.name);
+  if (missing.length) throw new RuleError(`Falta escolher deck: ${missing.join(', ')}.`);
+  const players = s.players.map(p => {
+    const d = r.decks.get(p.id)!;
+    return {
+      pid: p.id, name: p.name,
+      deck: { name: d.name, entries: d.entries.map(e => ({ name: e.data.name, set: e.data.set ?? '', num: e.data.num ?? '', count: e.count, commander: !!e.commander })) },
+    };
+  });
+  r.xm.clear(); r.xmLog = []; r.xmStarted = false; r.engineInfo.error = '';
+  r.engine.send(JSON.stringify({ t: 'start', players, life: s.settings.startingLife }));
+  step(s, actor, { type: 'xmageStart' }, ctx);
+}
+
+function onEngineMessage(roomId: string, r: Room, raw: string) {
+  let m: any;
+  try { m = JSON.parse(raw); } catch { return; }
+  switch (m.t) {
+    case 'hello': r.engineInfo.version = String(m.version ?? ''); broadcast(roomId); break;
+    case 'status': r.engineInfo.status = String(m.text ?? ''); broadcast(roomId); break;
+    case 'error': {
+      r.engineInfo.error = String(m.text ?? 'Erro no motor.');
+      // se a partida nem chegou a começar, volta ao lobby para corrigir (deck, cartas...)
+      if (r.state.phase === 'xmage' && !r.xmStarted) { r.state.phase = 'lobby'; r.state.version++; }
+      broadcast(roomId);
+      break;
+    }
+    case 'to': {
+      const pid = String(m.pid);
+      const { t: _t, pid: _p, ...body } = m;
+      const c = r.xm.get(pid) ?? { extra: [] };
+      if (body.kind === 'state') c.state = body.game;
+      else if (body.kind === 'prompt') c.prompt = body.prompt;
+      else if (body.kind === 'started') { r.xmStarted = true; r.engineInfo.error = ''; }
+      else if (body.kind === 'over' || body.kind === 'result') { c.prompt = undefined; c.extra.push(body); }
+      r.xm.set(pid, c);
+      for (const [sid, info] of r.sockets) if (info.playerId === pid) io.to(sid).emit('xm', body);
+      break;
+    }
+    case 'log': {
+      const e = { id: (r.xmLog.at(-1)?.id ?? 0) + 1, user: String(m.user ?? ''), text: String(m.text ?? ''), type: String(m.type ?? '') };
+      r.xmLog.push(e);
+      if (r.xmLog.length > 400) r.xmLog.splice(0, r.xmLog.length - 400);
+      io.to(roomId).emit('xmlog', [e]);
+      break;
+    }
+  }
+  r.touched = Date.now();
+}
+
+const engineWss = new WebSocketServer({ noServer: true, maxPayload: 8e6 });
+http.on('upgrade', (req, sock, head) => {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  if (url.pathname !== '/engine') return; // o socket.io cuida do resto
+  const roomId = (url.searchParams.get('room') ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const r = rooms.get(roomId);
+  engineWss.handleUpgrade(req, sock, head, ws => {
+    if (!r || req.headers['x-engine-key'] !== r.engineKey) { ws.close(4401, 'chave invalida'); return; }
+    if (r.engine && r.engine.readyState === WebSocket.OPEN) r.engine.close(4409, 'outro motor assumiu');
+    r.engine = ws;
+    r.engineInfo = { status: 'Motor ligado', error: '', version: undefined };
+    ws.send(JSON.stringify({ t: 'welcome', room: roomId }));
+    broadcast(roomId);
+    ws.on('message', data => onEngineMessage(roomId, r, data.toString()));
+    ws.on('close', () => {
+      if (r.engine === ws) { r.engine = null; r.engineInfo.status = 'Motor desligado'; broadcast(roomId); }
+    });
+    ws.on('error', () => { /* o close vem em seguida */ });
   });
 });
 

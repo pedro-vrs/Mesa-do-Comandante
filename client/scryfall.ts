@@ -45,6 +45,8 @@ function toCardData(c: any): CardData {
     imageBack: f1?.image_uris?.normal,
     backName: f1?.name,
     legalCommander: c.legalities?.commander,
+    set: c.set,
+    num: c.collector_number,
   };
 }
 

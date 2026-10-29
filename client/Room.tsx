@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useRoom } from './net';
 import { Table } from './Table';
+import { XTable } from './XTable';
 import { DeckManager } from './DeckManager';
 import { getPref, setPref } from './decks';
 
@@ -34,6 +35,7 @@ function Joined({ roomId, name, spectate, go }: { roomId: string; name: string; 
     <main className="home narrow"><h1 className="brand small">Mesa do Comandante</h1><p className="err">{room.error}</p><button className="btn" onClick={() => go('/')}>Voltar ao início</button></main>
   );
   if (!v) return <main className="home narrow"><p className="muted">Entrando na mesa {roomId}…</p></main>;
+  if (v.phase === 'xmage') return <XTable room={room} />;
   if (v.phase !== 'lobby') return <Table room={room} />;
 
   const me = v.players.find(p => p.id === v.you);
@@ -41,6 +43,9 @@ function Joined({ roomId, name, spectate, go }: { roomId: string; name: string; 
   const link = `${location.origin}/r/${roomId}`;
   const copy = async () => { try { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch { prompt('Copie o link:', link); } };
   const allDecks = v.players.length > 0 && v.players.every(p => p.deckSize > 0);
+  const xmode = v.settings.mode === 'xmage';
+  const engineOn = !!v.xmage?.connected;
+  const canStart = allDecks && (!xmode || (engineOn && v.players.length >= 2));
 
   return (
     <main className="lobby">
@@ -77,10 +82,37 @@ function Joined({ roomId, name, spectate, go }: { roomId: string; name: string; 
         </section>
         <section className="settings">
           <h2>Regras da mesa</h2>
+          <fieldset disabled={!host} className="mode-pick">
+            <label className={`mode ${!xmode ? 'on' : ''}`}>
+              <input type="radio" name="mode" checked={!xmode} onChange={() => room.send({ type: 'settings', settings: { mode: 'manual' } })} />
+              <span><b>Mesa assistida</b><br /><span className="muted small">Funciona com qualquer carta. A mesa cuida de vida, mana, fases e comandante; os efeitos das cartas vocês aplicam.</span></span>
+            </label>
+            <label className={`mode ${xmode ? 'on' : ''}`}>
+              <input type="radio" name="mode" checked={xmode} onChange={() => room.send({ type: 'settings', settings: { mode: 'xmage' } })} />
+              <span><b>Regras completas (XMage)</b><br /><span className="muted small">O motor do XMage, rodando no computador do anfitrião, aplica o efeito de cada carta, o combate e a pilha.</span></span>
+            </label>
+          </fieldset>
+          {xmode && (
+            <div className={`engine-box ${engineOn ? 'on' : ''}`}>
+              <p className="engine-status"><span className="dot" />{engineOn ? `Motor ligado${v.xmage?.version ? ` (versão ${v.xmage.version})` : ''}` : 'Motor desligado'}</p>
+              {v.xmage?.error && <p className="err small">{v.xmage.error}</p>}
+              {host && !engineOn && (
+                <ol className="small engine-steps">
+                  <li>No seu computador, abra o <b>Motor da Mesa</b>.</li>
+                  <li>Informe a mesa <code>{roomId}</code> e a chave <code>{v.xmage?.key}</code>.</li>
+                  <li>Deixe o motor aberto durante a partida. Esta caixa fica verde quando ele conectar.</li>
+                </ol>
+              )}
+              {!host && !engineOn && <p className="muted small">Esperando o anfitrião ligar o motor do XMage no computador dele.</p>}
+              {engineOn && <p className="muted small">Cartas que o XMage ainda não implementou impedem o início; o motor avisa quais são.</p>}
+            </div>
+          )}
           <fieldset disabled={!host}>
             <label className="field inline"><span>Vida inicial</span>
               <input type="number" min={1} max={999} value={v.settings.startingLife} onChange={e => room.send({ type: 'settings', settings: { startingLife: Number(e.target.value) } })} />
             </label>
+          </fieldset>
+          <fieldset disabled={!host || xmode} className={xmode ? 'dim' : ''}>
             <label className="check"><input type="checkbox" checked={v.settings.autoUntap} onChange={e => room.send({ type: 'settings', settings: { autoUntap: e.target.checked } })} />
               <span>Desvirar sozinho no início do turno</span></label>
             <label className="check"><input type="checkbox" checked={v.settings.autoDraw} onChange={e => room.send({ type: 'settings', settings: { autoDraw: e.target.checked } })} />
@@ -93,8 +125,10 @@ function Joined({ roomId, name, spectate, go }: { roomId: string; name: string; 
           {!host && <p className="muted small">Só o anfitrião muda as regras.</p>}
           {host && (
             <>
-              <button className="btn primary big" disabled={!allDecks} onClick={() => room.send({ type: 'start' })}>Começar partida</button>
+              <button className="btn primary big" disabled={!canStart} onClick={() => room.send({ type: 'start' })}>{xmode ? 'Começar no XMage' : 'Começar partida'}</button>
               {!allDecks && <p className="muted small">Todos precisam escolher um deck.</p>}
+              {allDecks && xmode && !engineOn && <p className="muted small">Ligue o motor do XMage para começar.</p>}
+              {allDecks && xmode && engineOn && v.players.length < 2 && <p className="muted small">O XMage precisa de pelo menos 2 jogadores.</p>}
             </>
           )}
           <details className="shortcuts">

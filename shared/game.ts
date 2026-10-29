@@ -37,7 +37,7 @@ export function newGame(roomId: string, hostId: string): GameState {
     roomId, version: 0, phase: 'lobby', hostId, players: [], cards: {}, battlefield: [], stack: [],
     turn: { number: 0, activeId: '', step: 'untap', priorityId: '', passed: [] },
     log: [],
-    settings: { startingLife: 40, autoUntap: true, autoDraw: true, priority: false, enforce: true, maxPlayers: 6 },
+    settings: { startingLife: 40, autoUntap: true, autoDraw: true, priority: false, enforce: true, mode: 'manual', maxPlayers: 6 },
   };
 }
 
@@ -432,8 +432,10 @@ function assertCanTouch(s: GameState, actor: string, c: CardInst) {
 
 export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
   const me = player(s, actor);
+  if (s.phase === 'xmage' && !['chat', 'restart'].includes(a.type))
+    throw new RuleError('A partida está acontecendo no motor do XMage.');
   const playing = s.phase === 'playing';
-  const lobbyOnly = ['loadDeck', 'setReady', 'start', 'settings'];
+  const lobbyOnly = ['loadDeck', 'setReady', 'start', 'settings', 'xmageStart'];
   if (!playing && !lobbyOnly.includes(a.type) && !['chat', 'restart'].includes(a.type))
     throw new RuleError(s.phase === 'lobby' ? 'A partida ainda não começou.' : 'A partida acabou.');
   if (playing && me.lost && !['chat', 'rejoin'].includes(a.type))
@@ -462,7 +464,8 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
     case 'setReady': me.ready = a.ready; return;
     case 'settings': {
       if (actor !== s.hostId) throw new RuleError('Só quem criou a mesa muda as opções.');
-      const allowed: (keyof Settings)[] = ['startingLife', 'autoUntap', 'autoDraw', 'priority', 'enforce'];
+      const allowed: (keyof Settings)[] = ['startingLife', 'autoUntap', 'autoDraw', 'priority', 'enforce', 'mode'];
+      if (a.settings.mode && s.phase !== 'lobby') throw new RuleError('O modo da mesa só muda no lobby.');
       for (const k of allowed) if (a.settings[k] !== undefined) (s.settings as any)[k] = a.settings[k];
       s.settings.startingLife = Math.max(1, Math.min(999, Math.floor(s.settings.startingLife)));
       if (s.phase === 'lobby') for (const p of s.players) p.life = s.settings.startingLife;
@@ -503,6 +506,13 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
       }
       s.phase = 'lobby'; s.winnerId = undefined;
       log(s, ctx, `${me.name} voltou a mesa para o lobby`, actor);
+      return;
+    }
+    case 'xmageStart': {
+      // só o servidor manda esta ação, depois de entregar os decks ao motor
+      if (actor !== s.hostId) throw new RuleError('Só quem criou a mesa começa a partida.');
+      s.phase = 'xmage';
+      log(s, ctx, 'Partida enviada ao motor do XMage.');
       return;
     }
     case 'draw': draw(s, ctx, actor, Math.max(1, Math.min(20, a.n))); return;
