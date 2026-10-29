@@ -11,15 +11,19 @@ export interface Room {
   send: (a: Action) => Promise<boolean>;
   undo: () => void;
   peek: (n: number) => Promise<CardInst[]>;
-  toast: string;
-  setToast: (t: string) => void;
+  toast: Toast | null;
+  setToast: (t: string | Toast | null) => void;
 }
+
+/** Aviso na tela. `retry` aparece como "Fazer assim mesmo" quando a regra pode ser ignorada. */
+export interface Toast { text: string; retry?: () => void }
 
 export function useRoom(roomId: string, name: string, spectate: boolean): Room {
   const [view, setView] = useState<GameView | null>(null);
   const [error, setError] = useState('');
   const [status, setStatus] = useState<Room['status']>('connecting');
-  const [toast, setToast] = useState('');
+  const [toast, setToastRaw] = useState<Toast | null>(null);
+  const setToast = useCallback((t: string | Toast | null) => setToastRaw(typeof t === 'string' ? (t ? { text: t } : null) : t), []);
   const sock = useRef<Socket | null>(null);
 
   useEffect(() => {
@@ -41,16 +45,19 @@ export function useRoom(roomId: string, name: string, spectate: boolean): Room {
 
   useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(''), 3800);
+    const t = setTimeout(() => setToast(null), toast.retry ? 9000 : 3800);
     return () => clearTimeout(t);
   }, [toast]);
 
-  const send = useCallback((a: Action) => new Promise<boolean>(resolve => {
+  const send = useCallback((a: Action): Promise<boolean> => new Promise<boolean>(resolve => {
     sock.current?.emit('action', a, (r: any) => {
-      if (!r?.ok) setToast(r?.error ?? 'Ação recusada.');
+      if (!r?.ok) {
+        const retry = r?.overridable ? () => { setToast(null); send({ ...a, force: true } as Action); } : undefined;
+        setToast({ text: r?.error ?? 'Ação recusada.', retry });
+      }
       resolve(!!r?.ok);
     });
-  }), []);
+  }), [setToast]);
 
   const undo = useCallback(() => {
     sock.current?.emit('undo', (r: any) => { if (!r?.ok) setToast(r?.error ?? 'Nada para desfazer.'); });

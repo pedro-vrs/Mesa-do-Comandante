@@ -98,8 +98,8 @@ io.on('connection', (socket: Socket) => {
     const r = rooms.get(roomId);
     const pid = r?.sockets.get(socket.id)?.playerId;
     if (!r || !pid) return ack?.({ ok: false, error: 'Você está assistindo esta mesa.' });
+    const before = JSON.stringify(r.state);
     try {
-      const before = JSON.stringify(r.state);
       step(r.state, pid, a, ctx);
       if (!NOT_UNDOABLE.has(a.type)) {
         r.history.push({ snapshot: before, actor: pid });
@@ -109,8 +109,10 @@ io.on('connection', (socket: Socket) => {
       ack?.({ ok: true });
       broadcast(roomId);
     } catch (e) {
+      // ação recusada: volta ao estado de antes, inteiro (nada fica pela metade)
+      r.state = JSON.parse(before);
       if (!(e instanceof RuleError)) console.error(e);
-      ack?.({ ok: false, error: e instanceof RuleError ? e.message : 'Erro inesperado na mesa.' });
+      ack?.({ ok: false, error: e instanceof RuleError ? e.message : 'Erro inesperado na mesa.', overridable: e instanceof RuleError && e.overridable });
     }
   });
 

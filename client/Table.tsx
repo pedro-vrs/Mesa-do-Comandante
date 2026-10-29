@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Action, CardInst, CardData, GameView, PlayerState, Step, ZoneName } from '../shared/types';
 import { STEPS, STEP_LABEL, ZONE_LABEL } from '../shared/types';
-import { isType, warnings } from '../shared/game';
+import { commanderIdentity, isLand, isType, warnings } from '../shared/game';
+import { MANA, MANA_NAME, manaOptions, parseCost, poolTotal, type Mana } from '../shared/mana';
+import { getPref, setPref } from './decks';
 import type { Room } from './net';
 import { CardFace, CardOverlays } from './Card';
 import { ContextMenu, MenuItem, Modal } from './Menu';
@@ -24,6 +26,8 @@ export function Table({ room }: { room: Room }) {
   const [ghost, setGhost] = useState<{ iid: string; x: number; y: number; w: number; h: number } | null>(null);
   const [drawer, setDrawer] = useState(false);
   const [oppFocus, setOppFocus] = useState(0);
+  const [sideOpen, setSideOpen] = useState(getPref('side', 'open') !== 'closed');
+  const lastPointer = useRef({ x: innerWidth / 2, y: innerHeight / 2 });
   const drag = useRef<Drag | null>(null);
   const hovered = useRef<string | null>(null);
 
@@ -39,6 +43,42 @@ export function Table({ room }: { room: Room }) {
 
   const act = useCallback((a: Action) => send(a), [send]);
   const ask = (title: string, label: string, initial: string, onOk: (v: string) => void) => setModal({ kind: 'ask', title, label, initial, onOk });
+  const toggleSide = () => setSideOpen(o => { setPref('side', o ? 'closed' : 'open'); return !o; });
+
+  /** Conjurar: vai para a pilha; com as regras ligadas o custo é pago sozinho. Pergunta X quando tem. */
+  const cast = (c: CardInst) => {
+    if (v.settings.enforce && parseCost(c.data.manaCost).x)
+      ask(`Conjurar ${c.data.name}`, 'Valor de X', '1', n => act({ type: 'move', iids: [c.iid], to: 'stack', xValue: Math.max(0, Math.floor(Number(n)) || 0) }));
+    else act({ type: 'move', iids: [c.iid], to: 'stack' });
+  };
+
+  /** Virar: se a carta gera mais de uma cor, pergunta qual. */
+  const tapCards = (iids: string[], x?: number, y?: number) => {
+    if (iids.length === 1 && me && v.settings.enforce) {
+      const c = v.cards[iids[0]];
+      if (c && !c.tapped && c.controllerId === me.id) {
+        const opts = manaOptions(c, commanderIdentity(v, me.id));
+        if (opts.length > 1) {
+          setMenu({
+            x: x ?? lastPointer.current.x, y: y ?? lastPointer.current.y, title: `Virar ${c.data.name} para gerar`,
+            items: [
+              ...opts.map(o => ({ label: `Mana ${o.map(m => MANA_NAME[m]).join(' + ')}`, onClick: () => act({ type: 'tap', iids, mana: o.join('') }) })),
+              { label: 'Só virar, sem gerar mana', onClick: () => act({ type: 'tap', iids, mana: '-' }) },
+            ],
+          });
+          return;
+        }
+      }
+    }
+    act({ type: 'tap', iids });
+  };
+
+  const manaMenu = (x: number, y: number) => setMenu({
+    x, y, title: 'Reserva de mana', items: [
+      ...MANA.map(m => ({ label: `+1 ${MANA_NAME[m]}`, onClick: () => act({ type: 'addMana', mana: m, delta: 1 }) })),
+      ...(me && poolTotal(me.pool as any) ? [{ divider: true, label: '' }, ...MANA.filter(m => me.pool[m]).map(m => ({ label: `−1 ${MANA_NAME[m]}`, onClick: () => act({ type: 'addMana', mana: m, delta: -1 }) }))] : []),
+    ],
+  });
 
   // ---------- menus ----------
 
@@ -64,7 +104,7 @@ export function Table({ room }: { room: Room }) {
     if (mine && me) {
       if (c.zone === 'battlefield') {
         items.push(
-          { label: c.tapped ? 'Desvirar' : 'Virar', hint: 'T', onClick: () => act({ type: 'tap', iids }) },
+          { label: c.tapped ? 'Desvirar' : 'Virar', hint: 'T', onClick: () => tapCards(iids, x, y) },
           { label: 'Marcador +1/+1', hint: '+', onClick: () => act({ type: 'counter', iid: c.iid, kind: '+1/+1', delta: 1 }) },
           { label: 'Marcador −1/−1', hint: '−', onClick: () => act({ type: 'counter', iid: c.iid, kind: '-1/-1', delta: 1 }) },
           {
@@ -99,7 +139,7 @@ export function Table({ room }: { room: Room }) {
         );
       } else if (c.zone === 'hand') {
         items.push(
-          { label: isType(c, 'land') ? 'Baixar terreno' : 'Conjurar (pilha)', hint: 'duplo clique', onClick: () => playFromHand(c) },
+          { label: isLand(c) ? 'Baixar terreno' : 'Conjurar (pilha)', hint: 'duplo clique', onClick: () => playFromHand(c) },
           { label: 'Pôr direto no campo', onClick: () => act({ type: 'move', iids: [c.iid], to: 'battlefield', ...nextSpot(c) }) },
           { label: 'Jogar virada para baixo', onClick: () => act({ type: 'move', iids: [c.iid], to: 'battlefield', faceDown: true, ...nextSpot(c) }) },
           { label: 'Revelar', onClick: () => act({ type: 'reveal', iids: [c.iid] }) },
@@ -112,7 +152,7 @@ export function Table({ room }: { room: Room }) {
         items.push({ label: 'Para o campo', onClick: () => act({ type: 'move', iids: [c.iid], to: 'battlefield', ...nextSpot(c) }) }, ...moveItems([c.iid], 'stack'));
       } else {
         items.push(
-          { label: c.zone === 'command' && c.isCommander ? `Conjurar (imposto +${(me.cmdCasts[c.iid] ?? 0) * 2})` : 'Conjurar (pilha)', onClick: () => act({ type: 'move', iids: [c.iid], to: 'stack' }) },
+          { label: c.zone === 'command' && c.isCommander ? `Conjurar (imposto +${(me.cmdCasts[c.iid] ?? 0) * 2})` : 'Conjurar (pilha)', onClick: () => cast(c) },
           { label: 'Pôr direto no campo', onClick: () => act({ type: 'move', iids: [c.iid], to: 'battlefield', ...nextSpot(c) }) },
           ...moveItems([c.iid], c.zone),
         );
@@ -128,14 +168,14 @@ export function Table({ room }: { room: Room }) {
   const nextSpot = (c: CardInst) => {
     if (!me) return {};
     const mine = v.battlefield.map(i => v.cards[i]).filter(x => x && x.controllerId === me.id);
-    const land = isType(c, 'land');
-    const row = mine.filter(x => isType(x, 'land') === land).length;
+    const land = isLand(c);
+    const row = mine.filter(x => isLand(x) === land).length;
     return { x: 0.02 + (row % 12) * 0.08, y: land ? 0.72 - Math.floor(row / 12) * 0.08 : 0.06 + Math.floor(row / 12) * 0.1 };
   };
 
   const playFromHand = (c: CardInst) => {
-    if (isType(c, 'land')) act({ type: 'move', iids: [c.iid], to: 'battlefield', ...nextSpot(c) });
-    else act({ type: 'move', iids: [c.iid], to: 'stack' });
+    if (isLand(c)) act({ type: 'move', iids: [c.iid], to: 'battlefield', ...nextSpot(c) });
+    else cast(c);
   };
 
   const libraryMenu = (x: number, y: number) => {
@@ -168,6 +208,7 @@ export function Table({ room }: { room: Room }) {
 
   useEffect(() => {
     const move = (e: PointerEvent) => {
+      lastPointer.current = { x: e.clientX, y: e.clientY };
       const d = drag.current;
       if (!d || e.pointerId !== d.pointerId) return;
       if (!d.moved && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) > 6) { d.moved = true; clearTimeout(d.timer); }
@@ -190,6 +231,8 @@ export function Table({ room }: { room: Room }) {
         const x = (e.clientX - d.ox - r.left) / Math.max(1, r.width - d.w);
         const y = (e.clientY - d.oy - r.top) / Math.max(1, r.height - d.h);
         const toPlayer = owner && owner !== me?.id ? owner : undefined;
+        // com regras ligadas, soltar uma mágica no campo é conjurar
+        if (v.settings.enforce && (c.zone === 'hand' || c.zone === 'command') && !isLand(c)) { cast(c); return; }
         if (c.zone === 'battlefield' && toPlayer && c.controllerId === me?.id) {
           act({ type: 'control', iid: c.iid, to: toPlayer }).then(() => act({ type: 'move', iids: [c.iid], to: 'battlefield', x, y }));
           return;
@@ -223,9 +266,9 @@ export function Table({ room }: { room: Room }) {
 
   const dblCard = (c: CardInst) => {
     if (!me) return;
-    if (c.zone === 'battlefield' && c.controllerId === me.id) act({ type: 'tap', iids: selected.includes(c.iid) ? selected : [c.iid] });
+    if (c.zone === 'battlefield' && c.controllerId === me.id) tapCards(selected.includes(c.iid) ? selected : [c.iid]);
     else if (c.zone === 'hand' && c.ownerId === me.id) playFromHand(c);
-    else if (c.zone === 'command' && c.ownerId === me.id) act({ type: 'move', iids: [c.iid], to: 'stack' });
+    else if (c.zone === 'command' && c.ownerId === me.id) cast(c);
   };
 
   // ---------- teclado ----------
@@ -248,7 +291,7 @@ export function Table({ room }: { room: Room }) {
         case 'e': act({ type: 'endTurn' }); break;
         case 'k': setModal({ kind: 'token' }); break;
         case ' ': if (v.settings.priority) { e.preventDefault(); act({ type: 'pass' }); } break;
-        case 't': if (targets.length && (mineH || !h)) act({ type: 'tap', iids: targets }); break;
+        case 't': if (targets.length && (mineH || !h)) tapCards(targets); break;
         case 'v': if (h) setModal({ kind: 'preview', c: h }); break;
         case 'f': if (h && mineH) act({ type: 'faceDown', iid: h.iid }); break;
         case 'r': if (h && mineH) act({ type: 'transform', iid: h.iid }); break;
@@ -281,7 +324,7 @@ export function Table({ room }: { room: Room }) {
   const focusOpp = seatOrder[Math.min(oppFocus, seatOrder.length - 1)];
 
   return (
-    <div className={`table ${attachFrom ? 'attaching' : ''} opp-${Math.min(seatOrder.length, 5)}`} onContextMenu={e => e.preventDefault()}>
+    <div className={`table ${attachFrom ? 'attaching' : ''} ${sideOpen ? '' : 'side-closed'} opp-${Math.min(seatOrder.length, 5)}`} onContextMenu={e => e.preventDefault()}>
       <div className="opponents">
         {seatOrder.length > 1 && (
           <div className="opp-tabs" role="tablist" aria-label="Oponentes">
@@ -294,10 +337,16 @@ export function Table({ room }: { room: Room }) {
         ))}
       </div>
 
-      <TurnRail v={v} me={me} act={act} />
+      <TurnRail v={v} me={me} act={act}>
+        {!sideOpen && (
+          <button className="btn side-tab" onClick={toggleSide} title="Mostrar a barra lateral">
+            Pilha e registro{(v.stack.length > 0 || prompts.length > 0) && <b>{v.stack.length || '!'}</b>}
+          </button>
+        )}
+      </TurnRail>
 
       <Mat p={mainPlayer} v={v} me={me} focused warnIds={warnIds} selected={selected} cardProps={cardProps} act={act}
-        onZone={(zone) => setModal({ kind: 'zone', playerId: mainPlayer.id, zone })} onLibrary={libraryMenu} isMain />
+        onZone={(zone) => setModal({ kind: 'zone', playerId: mainPlayer.id, zone })} onLibrary={libraryMenu} onMana={manaMenu} isMain />
 
       {me && (
         <div className="hand" data-drop="hand" data-owner={me.id}>
@@ -333,13 +382,23 @@ export function Table({ room }: { room: Room }) {
                 { label: 'Habilidade na pilha', onClick: () => ask('Habilidade na pilha', 'O que a habilidade faz?', '', t => act({ type: 'ability', text: t })) },
                 { label: 'Desvirar tudo', onClick: () => act({ type: 'untapAll' }) },
                 ...(v.canUndo ? [{ label: 'Desfazer', onClick: room.undo }] : []),
+                ...(me.id === v.hostId ? [{ label: v.settings.enforce ? 'Desligar regras de turno e mana' : 'Ligar regras de turno e mana', onClick: () => act({ type: 'settings', settings: { enforce: !v.settings.enforce } }) }] : []),
               ],
             })}>Mais</button>
           </div>
         </div>
       )}
 
-      <aside className={`side ${drawer ? 'open' : ''}`}>
+      <aside className={`side ${drawer ? 'open' : ''}`} aria-label="Pilha e registro">
+        <div className="side-head">
+          <button className={`rules-chip ${v.settings.enforce ? 'on' : ''}`} disabled={me?.id !== v.hostId}
+            onClick={() => act({ type: 'settings', settings: { enforce: !v.settings.enforce } })}
+            title={me?.id === v.hostId ? 'Clique para ligar ou desligar' : 'Só o anfitrião muda'}>
+            Regras de turno e mana: {v.settings.enforce ? 'ligadas' : 'desligadas'}
+          </button>
+          <button className="btn ghost small side-collapse" onClick={toggleSide} title="Recolher a barra lateral">Recolher</button>
+          <button className="btn ghost small side-close" onClick={() => setDrawer(false)}>Fechar</button>
+        </div>
         <Stack v={v} me={me} act={act} cardProps={cardProps} />
         {prompts.map(pr => {
           const c = v.cards[pr.iid];
@@ -363,6 +422,7 @@ export function Table({ room }: { room: Room }) {
         {preview && <div className="preview" aria-hidden="true"><CardFace c={preview} /><CardOverlays c={preview} /></div>}
       </aside>
       {drawer && <div className="drawer-back" onPointerDown={() => setDrawer(false)} />}
+
 
       {ghost && v.cards[ghost.iid] && (
         <div className="card ghost" style={{ left: ghost.x, top: ghost.y, width: ghost.w, height: ghost.h }}><CardFace c={v.cards[ghost.iid]} /></div>
@@ -390,7 +450,15 @@ export function Table({ room }: { room: Room }) {
         </div>
       )}
 
-      {room.toast && <div className="toast" role="status">{room.toast}</div>}
+      {room.toast && (
+        <div className={`toast ${room.toast.retry ? 'has-action' : ''}`} role="status">
+          <span>{room.toast.text}</span>
+          {room.toast.retry && <span className="toast-actions">
+            <button className="btn primary small" onClick={room.toast.retry}>Fazer assim mesmo</button>
+            <button className="btn ghost small" onClick={() => room.setToast(null)}>Cancelar</button>
+          </span>}
+        </div>
+      )}
       {room.status === 'offline' && <div className="toast warn" role="status">Sem conexão com a mesa. Tentando reconectar…</div>}
     </div>
   );
@@ -400,9 +468,10 @@ export function Table({ room }: { room: Room }) {
 
 type CardPropsFn = (c: CardInst) => Record<string, any>;
 
-function Mat({ p, v, me, compact, focused, isMain, warnIds, selected, cardProps, act, onZone, onLibrary }: {
+function Mat({ p, v, me, compact, focused, isMain, warnIds, selected, cardProps, act, onZone, onLibrary, onMana }: {
   p: PlayerState; v: GameView; me?: PlayerState; compact?: boolean; focused?: boolean; isMain?: boolean; warnIds: Set<string>; selected: string[];
   cardProps: CardPropsFn; act: (a: Action) => Promise<boolean>; onZone: (z: 'graveyard' | 'exile') => void; onLibrary: (x: number, y: number) => void;
+  onMana?: (x: number, y: number) => void;
 }) {
   const isMe = me?.id === p.id;
   const active = v.turn.activeId === p.id;
@@ -431,6 +500,13 @@ function Mat({ p, v, me, compact, focused, isMain, warnIds, selected, cardProps,
         <div className="stats">
           <Stat label="veneno" value={p.poison} danger={p.poison >= 7} onPlus={isMe ? () => act({ type: 'playerCounter', kind: 'poison', delta: 1 }) : undefined} onMinus={isMe ? () => act({ type: 'playerCounter', kind: 'poison', delta: -1 }) : undefined} hideZero={!isMe} />
           {Object.entries(p.counters).filter(([k, n]) => k !== 'mulligan' && n > 0).map(([k, n]) => <Stat key={k} label={k} value={n} onPlus={isMe ? () => act({ type: 'playerCounter', kind: k, delta: 1 }) : undefined} onMinus={isMe ? () => act({ type: 'playerCounter', kind: k, delta: -1 }) : undefined} />)}
+          {(poolTotal(p.pool as any) > 0 || (isMe && v.settings.enforce)) && (
+            <span className="pool" aria-label="Reserva de mana">
+              {MANA.filter(m => p.pool[m] > 0).map(m => <span key={m} className={`mana m-${m}`} title={`Mana ${MANA_NAME[m]}`}>{p.pool[m]}</span>)}
+              {isMe && onMana && <button className="pool-add" onClick={e => onMana(e.clientX, e.clientY)} title="Adicionar mana à mão (para cartas que a mesa não lê)" aria-label="Ajustar reserva de mana">{poolTotal(p.pool as any) ? '±' : 'mana ±'}</button>}
+            </span>
+          )}
+          {isMe && v.settings.enforce && active && <span className={`chip ${p.landsPlayed >= 1 ? 'used' : ''}`} title="Terrenos baixados neste turno">terreno {p.landsPlayed}/1</span>}
           {!isMe && dmgTaken.map(([cid, n]) => <span key={cid} className={`chip ${n >= 15 ? 'hot' : ''}`} title={`Dano de ${v.cards[cid]?.data.name}`}>{shortName(v.cards[cid]?.data.name)} {n}/21</span>)}
         </div>
         {isMe && enemyCmds.length > 0 && (
@@ -526,7 +602,7 @@ function Stat({ label, value, onPlus, onMinus, danger, hideZero }: { label: stri
 
 // ---------- régua de turno ----------
 
-function TurnRail({ v, me, act }: { v: GameView; me?: PlayerState; act: (a: Action) => Promise<boolean> }) {
+function TurnRail({ v, me, act, children }: { v: GameView; me?: PlayerState; act: (a: Action) => Promise<boolean>; children?: React.ReactNode }) {
   const active = v.players.find(p => p.id === v.turn.activeId);
   const mine = me?.id === v.turn.activeId;
   const prio = v.players.find(p => p.id === v.turn.priorityId);
@@ -551,6 +627,7 @@ function TurnRail({ v, me, act }: { v: GameView; me?: PlayerState; act: (a: Acti
         )}
         {mine && <button className="btn" onClick={() => act({ type: 'nextStep' })} title="Próximo passo (N)">Próximo passo</button>}
         {mine && <button className="btn primary" onClick={() => act({ type: 'endTurn' })} title="Passar a vez (E)">Passar a vez</button>}
+        {children}
       </div>
     </nav>
   );
@@ -563,7 +640,12 @@ function Stack({ v, me, act, cardProps }: { v: GameView; me?: PlayerState; act: 
   return (
     <div className="stack" data-drop="stack" aria-label="Pilha">
       <h3>Pilha {items.length > 0 && <span className="muted">({items.length})</span>}</h3>
-      {items.length === 0 ? <p className="muted small">Vazia. Arraste uma mágica para cá para conjurar.</p> : (
+      <p className="muted small stack-help">
+        {items.length === 0
+          ? 'Quando alguém conjura uma mágica ou ativa uma habilidade, ela espera aqui até resolver. Nada esperando agora.'
+          : 'Esperando para resolver. A de cima resolve primeiro; antes disso, qualquer um pode responder.'}
+      </p>
+      {items.length > 0 && (
         <ol>
           {items.map((iid, i) => {
             const c = v.cards[iid];
@@ -591,13 +673,25 @@ function Stack({ v, me, act, cardProps }: { v: GameView; me?: PlayerState; act: 
 function Log({ v, act, canChat }: { v: GameView; act: (a: Action) => Promise<boolean>; canChat: boolean }) {
   const ref = useRef<HTMLOListElement>(null);
   const [text, setText] = useState('');
-  useEffect(() => { ref.current?.scrollTo({ top: ref.current.scrollHeight }); }, [v.log.length]);
+  const [filter, setFilter] = useState<'all' | 'game' | 'chat'>(() => (getPref('logFilter', 'all') as any));
+  const pick = (f: typeof filter) => { setFilter(f); setPref('logFilter', f); };
+  const shown = v.log.filter(l => filter === 'all' || (filter === 'chat' ? l.kind === 'chat' : l.kind !== 'chat')).slice(-150);
+  useEffect(() => { ref.current?.scrollTo({ top: ref.current.scrollHeight }); }, [shown.length, filter]);
   const color = (pid?: string) => v.players.find(p => p.id === pid)?.color;
+  const labels = { all: 'Tudo', game: 'Jogo', chat: 'Chat' } as const;
   return (
     <div className="log">
-      <h3>Registro</h3>
+      <div className="log-head">
+        <h3>Registro</h3>
+        <div className="seg" role="tablist" aria-label="Filtrar registro">
+          {(['all', 'game', 'chat'] as const).map(f => (
+            <button key={f} role="tab" aria-selected={filter === f} onClick={() => pick(f)}>{labels[f]}</button>
+          ))}
+        </div>
+      </div>
       <ol ref={ref} aria-live="polite">
-        {v.log.slice(-120).map(l => <li key={l.id} style={{ '--seat': color(l.playerId) ?? 'transparent' } as any}>{l.text}</li>)}
+        {shown.map(l => <li key={l.id} className={l.kind === 'chat' ? 'chat' : ''} style={{ '--seat': color(l.playerId) ?? 'transparent' } as any}>{l.text}</li>)}
+        {shown.length === 0 && <li className="muted">{filter === 'chat' ? 'Ninguém falou nada ainda.' : 'Nada por aqui ainda.'}</li>}
       </ol>
       {canChat && (
         <form onSubmit={e => { e.preventDefault(); if (text.trim()) { act({ type: 'chat', text }); setText(''); } }}>

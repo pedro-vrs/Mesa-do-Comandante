@@ -13,6 +13,10 @@ que não dependem de ler o texto da carta, inspiradas no motor do XMage.
 - Pilha: mágica instantânea ou feitiço resolve para o cemitério; permanente resolve para o campo.
 - Contadores +1/+1 e −1/−1 se anulam; tokens somem ao sair do campo; modificadores "até o fim do turno" zeram na limpeza.
 - Avisos (sem agir): resistência 0, regra da lenda, aura solta, planeswalker sem lealdade.
+- Regras de turno e mana (ligadas por padrão): um terreno por turno, só na fase principal; mágicas que não são
+  instantâneas só na sua fase principal com a pilha vazia; conjurar cobra o custo (com imposto e X) e vira os terrenos
+  sozinho; virar terreno gera mana na reserva, que esvazia a cada passo; criatura que acabou de entrar não vira por mana.
+  Como a mesa não lê o texto de cada carta, toda recusa oferece "Fazer assim mesmo", e isso fica no registro.
 - Modo prioridade opcional, como no XMage: quando todos passam, a pilha resolve ou o turno avança.
 - Desfazer a própria última ação (Ctrl+Z).
 - Informação oculta: mão e grimório dos outros nunca chegam ao seu navegador.

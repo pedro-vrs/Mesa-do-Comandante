@@ -25,8 +25,9 @@ function deck(commander: string): DeckEntry[] {
   ];
 }
 
-function table(players = 2, c = ctx()): { s: GameState; c: Ctx } {
+function table(players = 2, c = ctx(), enforce = false): { s: GameState; c: Ctx } {
   const s = newGame('r', '');
+  s.settings.enforce = enforce;
   for (let i = 0; i < players; i++) {
     addPlayer(s, `p${i}`, `P${i}`);
     step(s, `p${i}`, { type: 'loadDeck', name: 'd', entries: deck(`Cmd${i}`) }, c);
@@ -202,5 +203,127 @@ describe('informação oculta', () => {
     const { s, c } = table();
     const theirs = s.players[1].zones.hand[0];
     expect(() => step(s, 'p0', { type: 'move', iids: [theirs], to: 'graveyard' }, c)).toThrow();
+  });
+});
+
+// ---------- regras de turno e mana ----------
+import { parseCost, manaOptions, planPayment, emptyPool } from './mana.js';
+import { blankCard } from './game.js';
+
+describe('mana: leitura de custos e fontes', () => {
+  it('lê custos com genérico, cores, híbrido, phyrexiano e X', () => {
+    expect(parseCost('{2}{G}{G}')).toMatchObject({ generic: 2, colored: ['G', 'G'], x: 0 });
+    expect(parseCost('{X}{R}')).toMatchObject({ generic: 0, colored: ['R'], x: 1 });
+    expect(parseCost('{W/U}{2/B}{G/P}')).toMatchObject({ hybrid: [['W', 'U'], ['2', 'B']], phyrexian: ['G'] });
+    expect(parseCost('{1}{U} // {3}{R}')).toMatchObject({ generic: 1, colored: ['U'] });
+  });
+
+  it('descobre o que cada terreno ou artefato gera', () => {
+    const mk = (typeLine: string, oracle: string) => blankCard('x', 'p', card('X', typeLine, { oracle }), 'battlefield');
+    expect(manaOptions(mk('Basic Land — Forest', '({T}: Add {G}.)'))).toEqual([['G']]);
+    expect(manaOptions(mk('Artifact', '{T}: Add {C}{C}.'))).toEqual([['C', 'C']]);
+    expect(manaOptions(mk('Land — Forest Island', '({T}: Add {G} or {U}.)'))).toEqual([['G'], ['U']]);
+    expect(manaOptions(mk('Land', '{T}: Add {C}.\n{T}: Add one mana of any color in your commander\'s color identity.'), ['G', 'W'])).toEqual([['C'], ['G'], ['W']]);
+    expect(manaOptions(mk('Artifact', '{1}, {T}: Add {C}{C}.'))).toEqual([]); // custo com mana não conta
+    expect(manaOptions(mk('Basic Land — Swamp', ''))).toEqual([['B']]);    // sem texto: pelo tipo
+  });
+
+  it('planeja o pagamento sem desperdiçar a cor que ainda vai ser pedida', () => {
+    const plan = planPayment(parseCost('{1}{G}'), 0, 0, emptyPool(), [
+      { iid: 'dual', options: [['G'], ['U']] }, { iid: 'forest', options: [['G']] }, { iid: 'ring', options: [['C', 'C']] },
+    ], 40);
+    expect('taps' in plan && plan.taps.map(t => t.iid).sort()).toEqual(['forest', 'ring']);
+    const fail = planPayment(parseCost('{U}{U}'), 0, 0, emptyPool(), [{ iid: 'f', options: [['G']] }], 40);
+    expect(fail).toEqual({ missing: '{U}{U}' });
+  });
+});
+
+describe('regras de turno e mana', () => {
+  /** Mesa com regras ligadas, já na fase principal 1 do jogador ativo. */
+  function ruled() {
+    const { s, c } = table(2, ctx(7), true);
+    const a = s.turn.activeId, b = a === 'p0' ? 'p1' : 'p0';
+    step(s, a, { type: 'setStep', step: 'main1' }, c);
+    // põe na mão do ativo: 3 florestas, um elfo, um Giant Growth
+    const give = (name: string) => {
+      const x = Object.values(s.cards).find(k => k.ownerId === a && k.data.name === name && k.zone === 'library')!;
+      const pl = s.players.find(p => p.id === a)!;
+      pl.zones.library = pl.zones.library.filter(i => i !== x.iid); x.zone = 'hand'; pl.zones.hand.push(x.iid);
+      return x;
+    };
+    return { s, c, a, b, give };
+  }
+
+  it('só um terreno por turno, e só na fase principal do próprio turno', () => {
+    const { s, c, a, b, give } = ruled();
+    const f1 = give('Forest'), f2 = give('Forest');
+    step(s, a, { type: 'move', iids: [f1.iid], to: 'battlefield' }, c);
+    expect(() => step(s, a, { type: 'move', iids: [f2.iid], to: 'battlefield' }, c)).toThrow(/já baixou um terreno/);
+    // com "fazer assim mesmo" passa, e fica registrado
+    step(s, a, { type: 'move', iids: [f2.iid], to: 'battlefield', force: true }, c);
+    expect(s.log.some(l => l.text.includes('passou por cima'))).toBe(true);
+    const bl = s.players.find(p => p.id === b)!.zones.hand.map(i => s.cards[i]).find(k => k.data.name === 'Forest');
+    if (bl) expect(() => step(s, b, { type: 'move', iids: [bl.iid], to: 'battlefield' }, c)).toThrow(/seu turno/);
+  });
+
+  it('conjurar cobra o custo virando os terrenos sozinho', () => {
+    const { s, c, a, give } = ruled();
+    const forest = give('Forest'), elf = give('Llanowar Elves');
+    step(s, a, { type: 'move', iids: [forest.iid], to: 'battlefield' }, c);
+    s.cards[elf.iid].data = { ...s.cards[elf.iid].data, manaCost: '{G}' };
+    step(s, a, { type: 'move', iids: [elf.iid], to: 'stack' }, c);
+    expect(s.cards[forest.iid].tapped).toBe(true);
+    expect(s.stack).toContain(elf.iid);
+  });
+
+  it('recusa sem mana, e a recusa pode ser ignorada', () => {
+    const { s, c, a, give } = ruled();
+    const elf = give('Llanowar Elves');
+    s.cards[elf.iid].data = { ...s.cards[elf.iid].data, manaCost: '{G}' };
+    expect(() => step(s, a, { type: 'move', iids: [elf.iid], to: 'stack' }, c)).toThrow(/Mana insuficiente/);
+    step(s, a, { type: 'move', iids: [elf.iid], to: 'stack', force: true }, c);
+    expect(s.stack).toContain(elf.iid);
+  });
+
+  it('feitiço fora da fase principal é recusado; instantânea passa', () => {
+    const { s, c, a, b, give } = ruled();
+    const gg = give('Giant Growth');
+    const anthem = give('Glorious Anthem');
+    step(s, a, { type: 'setStep', step: 'attackers' }, c);
+    expect(() => step(s, a, { type: 'move', iids: [anthem.iid], to: 'stack' }, c)).toThrow(/fase principal/);
+    step(s, a, { type: 'move', iids: [gg.iid], to: 'stack' }, c); // custo vazio no teste: passa
+    expect(s.stack).toContain(gg.iid);
+  });
+
+  it('imposto do comandante entra no custo', () => {
+    const { s, c, a } = ruled();
+    const cmd = Object.values(s.cards).find(k => k.ownerId === a && k.isCommander)!;
+    cmd.data = { ...cmd.data, manaCost: '{G}' };
+    s.players.find(p => p.id === a)!.pool.G = 1;
+    step(s, a, { type: 'move', iids: [cmd.iid], to: 'stack' }, c);
+    step(s, a, { type: 'resolve' }, c);
+    step(s, a, { type: 'move', iids: [cmd.iid], to: 'command' }, c);
+    s.players.find(p => p.id === a)!.pool.G = 1;
+    // agora custa {G} + 2 de imposto: só 1 mana na reserva
+    expect(() => step(s, a, { type: 'move', iids: [cmd.iid], to: 'stack' }, c)).toThrow(/falta \{2\}/);
+  });
+
+  it('virar terreno gera mana na reserva, e a reserva esvazia ao mudar de passo', () => {
+    const { s, c, a, give } = ruled();
+    const f = give('Forest');
+    step(s, a, { type: 'move', iids: [f.iid], to: 'battlefield' }, c);
+    step(s, a, { type: 'tap', iids: [f.iid] }, c);
+    expect(s.players.find(p => p.id === a)!.pool.G).toBe(1);
+    step(s, a, { type: 'nextStep' }, c);
+    expect(s.players.find(p => p.id === a)!.pool.G).toBe(0);
+  });
+
+  it('criatura que acabou de entrar não vira para gerar mana', () => {
+    const { s, c, a, give } = ruled();
+    const elf = give('Llanowar Elves');
+    s.cards[elf.iid].data = { ...s.cards[elf.iid].data, oracle: '{T}: Add {G}.' };
+    step(s, a, { type: 'move', iids: [elf.iid], to: 'stack', force: true }, c);
+    step(s, a, { type: 'resolve' }, c);
+    expect(() => step(s, a, { type: 'tap', iids: [elf.iid] }, c)).toThrow(/enjoo/);
   });
 });

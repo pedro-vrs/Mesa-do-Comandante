@@ -85,6 +85,8 @@ function Joined({ roomId, name, spectate, go }: { roomId: string; name: string; 
               <span>Desvirar sozinho no início do turno</span></label>
             <label className="check"><input type="checkbox" checked={v.settings.autoDraw} onChange={e => room.send({ type: 'settings', settings: { autoDraw: e.target.checked } })} />
               <span>Comprar sozinho no passo de compra</span></label>
+            <label className="check"><input type="checkbox" checked={v.settings.enforce} onChange={e => room.send({ type: 'settings', settings: { enforce: e.target.checked } })} />
+              <span>Regras de turno e mana: um terreno por turno, mágicas só no momento certo e custo pago com mana (a mesa vira os terrenos sozinha). Quando uma carta muda a regra, aparece “Fazer assim mesmo”.</span></label>
             <label className="check"><input type="checkbox" checked={v.settings.priority} onChange={e => room.send({ type: 'settings', settings: { priority: e.target.checked } })} />
               <span>Modo prioridade, como no XMage: cada um passa a vez de responder; quando todos passam, a pilha resolve ou o turno avança</span></label>
           </fieldset>
@@ -107,7 +109,7 @@ function Joined({ roomId, name, spectate, go }: { roomId: string; name: string; 
           </details>
         </section>
       </div>
-      {room.toast && <div className="toast" role="status">{room.toast}</div>}
+      {room.toast && <div className="toast" role="status">{room.toast.text}</div>}
     </main>
   );
 }

@@ -46,6 +46,7 @@ export interface CardInst {
   token?: boolean;
   ability?: boolean;      // item de pilha que é uma habilidade, não uma carta
   isCommander?: boolean;
+  enteredTurn?: number;   // turno em que entrou no campo (enjoo de invocação)
   x: number;              // posição no campo (0..1)
   y: number;
   ptMod: [number, number];
@@ -62,6 +63,8 @@ export interface PlayerState {
   cmdCasts: Record<string, number>;     // iid do comandante -> vezes conjurado da zona de comando
   lost: boolean;
   lossReason?: string;
+  pool: Record<'W' | 'U' | 'B' | 'R' | 'G' | 'C', number>;  // reserva de mana
+  landsPlayed: number;                  // terrenos baixados neste turno
   zones: Record<PlayerZone, string[]>;  // iids, índice 0 = topo
   deckName?: string;
   deckSize: number;
@@ -86,13 +89,14 @@ export const STEP_LABEL: Record<Step, string> = {
   end: 'Final', cleanup: 'Limpeza',
 };
 
-export interface LogEntry { id: number; t: number; playerId?: string; text: string }
+export interface LogEntry { id: number; t: number; playerId?: string; text: string; kind?: 'chat' | 'game' }
 
 export interface Settings {
   startingLife: number;
   autoUntap: boolean;     // desvira as permanentes do jogador ativo no passo de desvirar
   autoDraw: boolean;      // compra automática no passo de compra
   priority: boolean;      // modo XMage: passar prioridade resolve a pilha e avança os passos
+  enforce: boolean;       // regras de turno e mana: 1 terreno por turno, tempo de mágica, custo pago
   maxPlayers: number;
 }
 
@@ -124,8 +128,9 @@ export type Action =
   | { type: 'draw'; n: number }
   | { type: 'shuffle' }
   | { type: 'mulligan' }
-  | { type: 'move'; iids: string[]; to: ZoneName; toPlayer?: string; position?: 'top' | 'bottom'; x?: number; y?: number; faceDown?: boolean }
-  | { type: 'tap'; iids: string[]; value?: boolean }
+  | { type: 'move'; iids: string[]; to: ZoneName; toPlayer?: string; position?: 'top' | 'bottom'; x?: number; y?: number; faceDown?: boolean; xValue?: number; force?: boolean }
+  | { type: 'tap'; iids: string[]; value?: boolean; mana?: string; force?: boolean }
+  | { type: 'addMana'; mana: string; delta: number }
   | { type: 'untapAll' }
   | { type: 'transform'; iid: string }
   | { type: 'faceDown'; iid: string; value?: boolean }

@@ -7,17 +7,24 @@
 //  - tokens deixam de existir fora do campo (704.5d)
 //  - desvirar e comprar automáticos; sem compra no 1º turno em partida de 2 (103.8a)
 //  - modo prioridade: todos passam -> resolve o topo da pilha ou avança o passo (117.4)
+//  - regras de turno e mana (opcional): 1 terreno por turno (305.2), velocidade de feitiço (307.1),
+//    custo pago com mana e pagamento automático, reserva esvazia a cada passo (500.4),
+//    enjoo de invocação para virar criaturas por mana (302.6)
 
 import {
   Action, CardData, CardInst, GameState, PlayerState, PlayerZone, Settings, Step, STEPS,
   STEP_LABEL, ZONE_LABEL, ZoneName,
 } from './types.js';
+import { COLORS as MANA_COLORS, emptyPool, frontType, hasFlash, hasHaste, manaOptions, Mana, MANA, MANA_NAME, parseCost, planPayment, costToText } from './mana.js';
 
 export const COLORS = ['#e4572e', '#3b82f6', '#22a06b', '#a855f7', '#f59e0b', '#ec4899'];
 const PLAYER_ZONES: PlayerZone[] = ['library', 'hand', 'graveyard', 'exile', 'command'];
 const PUBLIC_ZONES: ZoneName[] = ['battlefield', 'graveyard', 'exile', 'command', 'stack'];
 
-export class RuleError extends Error {}
+export class RuleError extends Error {
+  /** true = é uma regra da mesa que o jogador pode ignorar ("fazer assim mesmo"). */
+  constructor(message: string, public overridable = false) { super(message); }
+}
 
 export interface Ctx {
   rand: () => number;   // [0,1)
@@ -30,7 +37,7 @@ export function newGame(roomId: string, hostId: string): GameState {
     roomId, version: 0, phase: 'lobby', hostId, players: [], cards: {}, battlefield: [], stack: [],
     turn: { number: 0, activeId: '', step: 'untap', priorityId: '', passed: [] },
     log: [],
-    settings: { startingLife: 40, autoUntap: true, autoDraw: true, priority: false, maxPlayers: 6 },
+    settings: { startingLife: 40, autoUntap: true, autoDraw: true, priority: false, enforce: true, maxPlayers: 6 },
   };
 }
 
@@ -44,7 +51,7 @@ export function addPlayer(s: GameState, id: string, name: string): PlayerState {
     id, name: name.trim().slice(0, 24) || `Jogador ${s.players.length + 1}`,
     color: COLORS.find(c => !used.has(c)) ?? COLORS[0],
     life: s.settings.startingLife, poison: 0, counters: {}, cmdDamage: {}, cmdCasts: {},
-    lost: false, zones: emptyZones(), deckSize: 0, ready: false, connected: true, prompts: [],
+    lost: false, pool: emptyPool(), landsPlayed: 0, zones: emptyZones(), deckSize: 0, ready: false, connected: true, prompts: [],
   };
   s.players.push(p);
   if (!s.hostId) s.hostId = id;
@@ -154,7 +161,8 @@ function moveCard(s: GameState, ctx: Ctx, actor: string, iid: string, to: ZoneNa
   c.zone = to;
   c.faceDown = o.faceDown ?? (to === 'battlefield' ? c.faceDown : false);
   if (to === 'battlefield') {
-    if (from !== 'battlefield') c.controllerId = o.toPlayer ?? actor;
+    if (from !== 'battlefield') { c.controllerId = o.toPlayer ?? actor; c.enteredTurn = s.turn.number; }
+    if (from === 'hand' && isLand(c) && !c.faceDown) player(s, actor).landsPlayed++;
     if (o.x !== undefined) c.x = clamp01(o.x);
     if (o.y !== undefined) c.y = clamp01(o.y);
     if (from !== 'battlefield') s.battlefield.push(iid);
@@ -294,6 +302,7 @@ function resetPasses(s: GameState, actor: string) {
 
 function enterStep(s: GameState, ctx: Ctx, step: Step) {
   s.turn.step = step;
+  for (const p of s.players) p.pool = emptyPool();   // 500.4: a reserva de mana esvazia entre passos
   s.turn.passed = [];
   s.turn.priorityId = s.turn.activeId;
   const active = player(s, s.turn.activeId);
@@ -316,6 +325,7 @@ function enterStep(s: GameState, ctx: Ctx, step: Step) {
 
 function passTurnTo(s: GameState, ctx: Ctx, pid: string) {
   s.turn.number += 1;
+  for (const p of s.players) p.landsPlayed = 0;
   s.turn.activeId = pid;
   log(s, ctx, `Turno ${s.turn.number}: ${player(s, pid).name}`);
   enterStep(s, ctx, 'untap');
@@ -344,6 +354,64 @@ function resolveTop(s: GameState, ctx: Ctx, actor: string) {
   }
   s.turn.passed = [];
   s.turn.priorityId = s.turn.activeId;
+}
+
+// ---------- regras de turno e mana ----------
+
+export function isLand(c: CardInst) { return frontType(c.data.typeLine).toLowerCase().includes('land'); }
+function isMain(s: GameState) { return s.turn.step === 'main1' || s.turn.step === 'main2'; }
+
+export function commanderIdentity(s: GameState, pid: string): string[] {
+  const ids = Object.values(s.cards).filter(c => c.ownerId === pid && c.isCommander).flatMap(c => c.data.colorIdentity);
+  return ids.length ? [...new Set(ids)] : [...MANA_COLORS];
+}
+
+export function summoningSick(s: GameState, c: CardInst) {
+  return isType(c, 'creature') && c.enteredTurn === s.turn.number && !hasHaste(c.data.oracle);
+}
+
+/** Fontes de mana que o jogador pode virar agora. */
+export function manaSources(s: GameState, pid: string) {
+  const identity = commanderIdentity(s, pid);
+  return s.battlefield.map(i => s.cards[i])
+    .filter(c => c && c.controllerId === pid && !c.tapped && !summoningSick(s, c))
+    .map(c => ({ iid: c.iid, options: manaOptions(c, identity) }))
+    .filter(x => x.options.length);
+}
+
+function checkTiming(s: GameState, actor: string, c: CardInst, to: ZoneName, a: { faceDown?: boolean }) {
+  const name = c.data.name;
+  if (to === 'battlefield' && c.zone === 'hand' && isLand(c)) {
+    if (s.turn.activeId !== actor) throw new RuleError('Só dá para baixar terreno no seu turno.', true);
+    if (!isMain(s) || s.stack.length) throw new RuleError('Terreno só na sua fase principal, com a pilha vazia.', true);
+    if (player(s, actor).landsPlayed >= 1) throw new RuleError('Você já baixou um terreno neste turno.', true);
+    return;
+  }
+  if (to === 'battlefield' && (c.zone === 'hand' || c.zone === 'command') && !a.faceDown)
+    throw new RuleError(`${name} precisa ser conjurada: arraste para a pilha ou dê duplo clique.`, true);
+  if (to === 'stack' && !c.ability && c.zone !== 'battlefield' && c.zone !== 'stack') {
+    if (isLand(c)) throw new RuleError('Terreno não se conjura: baixe direto no campo.', true);
+    const instant = frontType(c.data.typeLine).toLowerCase().includes('instant') || hasFlash(c.data.oracle);
+    if (!instant && !(s.turn.activeId === actor && isMain(s) && s.stack.length === 0))
+      throw new RuleError(`${name} só pode ser conjurada na sua fase principal, com a pilha vazia.`, true);
+  }
+}
+
+/** Paga o custo da carta: usa a reserva e vira as fontes que faltarem (pagamento automático). */
+function payFor(s: GameState, ctx: Ctx, actor: string, c: CardInst, xValue?: number) {
+  const p = player(s, actor);
+  const cost = parseCost(c.data.manaCost);
+  const tax = c.isCommander && c.zone === 'command' ? (p.cmdCasts[c.iid] ?? 0) * 2 : 0;
+  if (cost.x && (xValue === undefined || xValue < 0)) throw new RuleError(`Diga o valor de X para conjurar ${c.data.name}.`);
+  const plan = planPayment(cost, xValue ?? 0, tax, p.pool as any, manaSources(s, actor), p.life);
+  const text = costToText(cost, xValue ?? 0, tax);
+  if ('missing' in plan)
+    throw new RuleError(`Mana insuficiente para ${c.data.name} (${text}): falta ${plan.missing}. Vire outras fontes primeiro, ou passe por cima se uma carta deixa mais barato.`, true);
+  for (const t of plan.taps) s.cards[t.iid].tapped = true;
+  p.pool = plan.pool;
+  p.life -= plan.life;
+  if (text !== '{0}' || plan.life)
+    log(s, ctx, `${p.name} pagou ${text}${plan.taps.length ? ` virando ${plan.taps.map(t => s.cards[t.iid].data.name).join(', ')}` : ''}${plan.life ? ` e ${plan.life} de vida` : ''}`, actor);
 }
 
 // ---------- permissões ----------
@@ -394,7 +462,7 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
     case 'setReady': me.ready = a.ready; return;
     case 'settings': {
       if (actor !== s.hostId) throw new RuleError('Só quem criou a mesa muda as opções.');
-      const allowed: (keyof Settings)[] = ['startingLife', 'autoUntap', 'autoDraw', 'priority'];
+      const allowed: (keyof Settings)[] = ['startingLife', 'autoUntap', 'autoDraw', 'priority', 'enforce'];
       for (const k of allowed) if (a.settings[k] !== undefined) (s.settings as any)[k] = a.settings[k];
       s.settings.startingLife = Math.max(1, Math.min(999, Math.floor(s.settings.startingLife)));
       if (s.phase === 'lobby') for (const p of s.players) p.life = s.settings.startingLife;
@@ -431,6 +499,7 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
         for (const c of Object.values(s.cards)) if (c.ownerId === p.id) p.zones[c.zone as PlayerZone].push(c.iid);
         p.lost = false; p.lossReason = undefined; p.life = s.settings.startingLife; p.poison = 0;
         p.cmdDamage = {}; p.cmdCasts = {}; p.counters = {}; p.prompts = []; p.ready = false;
+        p.pool = emptyPool(); p.landsPlayed = 0;
       }
       s.phase = 'lobby'; s.winnerId = undefined;
       log(s, ctx, `${me.name} voltou a mesa para o lobby`, actor);
@@ -453,25 +522,49 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
     case 'move': {
       if (!a.iids.length) return;
       const toPlayer = a.toPlayer && player(s, a.toPlayer).id;
+      if (a.force) log(s, ctx, `${me.name} passou por cima de uma regra da mesa`, actor);
       for (const iid of a.iids) {
         const c = card(s, iid);
         assertCanTouch(s, actor, c);
+        if (s.settings.enforce && !a.force) {
+          checkTiming(s, actor, c, a.to, a);
+          if (a.to === 'stack' && !c.ability && c.zone !== 'battlefield' && c.zone !== 'stack') payFor(s, ctx, actor, c, a.xValue);
+        }
         // Zonas privadas e cemitério/exílio sempre são do dono; no campo, o destino escolhido vira controlador.
         moveCard(s, ctx, actor, iid, a.to, { position: a.position, x: a.x, y: a.y, faceDown: a.faceDown, toPlayer });
       }
       return;
     }
     case 'tap': {
+      const identity = commanderIdentity(s, actor);
+      const made: string[] = [];
       for (const iid of a.iids) {
         const c = card(s, iid);
         if (c.zone !== 'battlefield') continue;
         assertCanTouch(s, actor, c);
+        const tapping = (a.value ?? !c.tapped) && !c.tapped;
+        if (tapping && s.settings.enforce) {
+          const opts = manaOptions(c, identity);
+          if (opts.length) {
+            if (summoningSick(s, c) && !a.force)
+              throw new RuleError(`${c.data.name} entrou neste turno e ainda não pode ser virada (enjoo de invocação).`, true);
+            const chosen = opts.length === 1 ? opts[0] : opts.find(o => o.join('') === a.mana);
+            if (chosen) { for (const m of chosen) me.pool[m]++; made.push(chosen.map(m => `{${m}}`).join('')); }
+          }
+        }
         c.tapped = a.value ?? !c.tapped;
       }
       if (a.iids.length === 1) {
         const c = s.cards[a.iids[0]];
-        if (c) log(s, ctx, `${me.name} ${c.tapped ? 'virou' : 'desvirou'} ${cardName(c)}`, actor);
-      }
+        if (c) log(s, ctx, `${me.name} ${c.tapped ? 'virou' : 'desvirou'} ${cardName(c)}${made.length ? ` (+${made[0]})` : ''}`, actor);
+      } else if (made.length) log(s, ctx, `${me.name} virou ${a.iids.length} permanentes (+${made.join('')})`, actor);
+      return;
+    }
+    case 'addMana': {
+      const m = a.mana.toUpperCase() as Mana;
+      if (!MANA.includes(m)) throw new RuleError('Tipo de mana inválido.');
+      me.pool[m] = Math.max(0, me.pool[m] + a.delta);
+      log(s, ctx, `${me.name} ${a.delta > 0 ? 'adicionou' : 'tirou'} mana ${MANA_NAME[m]} ${a.delta > 0 ? 'à' : 'da'} reserva (${me.pool[m]})`, actor);
       return;
     }
     case 'untapAll':
@@ -633,7 +726,7 @@ export function apply(s: GameState, actor: string, a: Action, ctx: Ctx): void {
     }
     case 'chat': {
       const text = a.text.trim().slice(0, 300);
-      if (text) log(s, ctx, `${me.name}: ${text}`, actor);
+      if (text) { log(s, ctx, `${me.name}: ${text}`, actor); s.log[s.log.length - 1].kind = 'chat'; }
       return;
     }
     case 'reveal': {
