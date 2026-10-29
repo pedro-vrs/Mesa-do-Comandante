@@ -1,0 +1,10 @@
+{
+  "name": "Mesa do Comandante",
+  "short_name": "Mesa",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#1A2132",
+  "theme_color": "#1A2132",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
